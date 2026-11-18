@@ -26,6 +26,8 @@ pub enum Error {
     Invalid(&'static str),
     #[error("update cancelled")]
     Cancelled,
+    #[error("updater did not become ready before the deadline")]
+    ReadinessTimeout,
 }
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -74,6 +76,26 @@ pub struct Policy {
     pub max_package_size: u64,
 }
 impl Policy {
+    /// Verify against this policy's key or additional locally trusted keys.
+    /// Keys must never come from a remote manifest.
+    pub fn verify_manifest_with_keys(
+        &self,
+        bytes: &[u8],
+        signature: &[u8],
+        additional_keys: &[[u8; 32]],
+    ) -> Result<VerifiedManifest> {
+        if let Ok(manifest) = self.verify_manifest(bytes, signature) {
+            return Ok(manifest);
+        }
+        for key in additional_keys {
+            let mut candidate = self.clone();
+            candidate.public_key = *key;
+            if let Ok(manifest) = candidate.verify_manifest(bytes, signature) {
+                return Ok(manifest);
+            }
+        }
+        Err(Error::Invalid("manifest signature or policy rejected"))
+    }
     /// Verify Ed25519 first, then parse and enforce identity, version and platform.
     pub fn verify_manifest(&self, bytes: &[u8], signature: &[u8]) -> Result<VerifiedManifest> {
         if bytes.len() > 1024 * 1024 {
@@ -160,6 +182,16 @@ pub fn release_manifest(
     policy: &Policy,
     release: &Release,
 ) -> Result<(VerifiedManifest, Vec<u8>, Vec<u8>)> {
+    release_manifest_with_keys(client, policy, release, &[])
+}
+
+/// Fetch a release manifest and accept any locally provisioned rotation key.
+pub fn release_manifest_with_keys(
+    client: &UpdateClient,
+    policy: &Policy,
+    release: &Release,
+    additional_keys: &[[u8; 32]],
+) -> Result<(VerifiedManifest, Vec<u8>, Vec<u8>)> {
     let name = format!("update-{}-{}.json", policy.platform, policy.architecture);
     let fetch = |name: &str, limit: u64| -> Result<Vec<u8>> {
         let asset = release
@@ -178,7 +210,7 @@ pub fn release_manifest(
     };
     let bytes = fetch(&name, 1024 * 1024)?;
     let signature = fetch(&format!("{name}.sig"), 64)?;
-    let verified = policy.verify_manifest(&bytes, &signature)?;
+    let verified = policy.verify_manifest_with_keys(&bytes, &signature, additional_keys)?;
     if Version::parse(
         release
             .tag_name
@@ -207,7 +239,8 @@ pub struct Asset {
     pub name: String,
     pub browser_download_url: String,
 }
-/// Fetch release metadata from GitHub. Repository components are restricted to safe characters.
+/// Fetch up to 1,000 releases from GitHub, with a bounded response per page.
+/// Repository components are restricted to safe characters.
 pub fn github_releases(client: &UpdateClient, owner: &str, repo: &str) -> Result<Vec<Release>> {
     let valid = |s: &str| {
         !s.is_empty()
@@ -219,11 +252,28 @@ pub fn github_releases(client: &UpdateClient, owner: &str, repo: &str) -> Result
     if !valid(owner) || !valid(repo) {
         return Err(Error::Invalid("invalid repository"));
     }
-    Ok(get(
-        client,
-        &format!("https://api.github.com/repos/{owner}/{repo}/releases?per_page=100"),
-    )?
-    .json()?)
+    let mut releases = Vec::new();
+    for page in 1..=10 {
+        let response = get(
+            client,
+            &format!(
+                "https://api.github.com/repos/{owner}/{repo}/releases?per_page=100&page={page}"
+            ),
+        )?;
+        let mut bytes = Vec::new();
+        const MAX_PAGE_BYTES: u64 = 8 * 1024 * 1024;
+        response.take(MAX_PAGE_BYTES + 1).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_PAGE_BYTES {
+            return Err(Error::Invalid("release metadata exceeds size limit"));
+        }
+        let page: Vec<Release> = serde_json::from_slice(&bytes)?;
+        let last = page.len() < 100;
+        releases.extend(page);
+        if last {
+            break;
+        }
+    }
+    Ok(releases)
 }
 /// Select the highest SemVer tag satisfying the channel; beta accepts beta prereleases,
 /// nightly accepts nightly prereleases, stable accepts only final versions.
@@ -460,6 +510,24 @@ mod tests {
         assert!(p.verify_manifest(&b, &s).is_err());
     }
     #[test]
+    fn rotation_keys_are_local_and_still_enforce_policy() {
+        let (mut policy, bytes, signature) = fixture();
+        let old = policy.public_key;
+        policy.public_key = SigningKey::from_bytes(&[43; 32]).verifying_key().to_bytes();
+        assert!(policy.verify_manifest(&bytes, &signature).is_err());
+        assert!(
+            policy
+                .verify_manifest_with_keys(&bytes, &signature, &[old])
+                .is_ok()
+        );
+        policy.app_id = "another-app".into();
+        assert!(
+            policy
+                .verify_manifest_with_keys(&bytes, &signature, &[old])
+                .is_err()
+        );
+    }
+    #[test]
     fn version_and_channel() {
         let (mut p, b, s) = fixture();
         p.current_version = Version::parse("2.0.0").unwrap();
@@ -476,6 +544,54 @@ mod tests {
         std::fs::write(&path, b"xyz").unwrap();
         assert!(verify_package(&path, &m).is_err());
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn terminal_outcome_requires_a_complete_terminal_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        std::fs::write(&path, b"{\"stage\":\"install\",\"message\":\"working\",\"terminal\":false,\"success\":false}\n{\"stage\":\"unfinished\"").unwrap();
+        let events = read_update_events(dir.path()).unwrap();
+        assert_eq!(update_outcome(&events), UpdateOutcome::InProgress);
+        std::fs::write(
+            &path,
+            b"{\"stage\":\"failed\",\"message\":\"error\",\"terminal\":true,\"success\":false}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            update_outcome(&read_update_events(dir.path()).unwrap()),
+            UpdateOutcome::Failed
+        );
+        std::fs::write(
+            &path,
+            b"{\"stage\":\"done\",\"message\":\"launched\",\"terminal\":true,\"success\":true}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            update_outcome(&read_update_events(dir.path()).unwrap()),
+            UpdateOutcome::Succeeded
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn readiness_timeout_terminates_stalled_updater() {
+        use std::process::{Command, Stdio};
+        let mut child = Command::new("powershell.exe")
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "Start-Sleep -Seconds 10",
+            ])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        assert!(matches!(
+            wait_for_ready_timeout(&mut child, Duration::from_millis(100)),
+            Err(Error::ReadinessTimeout)
+        ));
+        assert!(child.try_wait().unwrap().is_some());
     }
 }
 
@@ -535,6 +651,23 @@ pub struct UpdateEvent {
     pub progress: Option<(u64, u64)>,
 }
 
+/// Persisted result of an update attempt. A launched process is not a health check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateOutcome {
+    InProgress,
+    Succeeded,
+    Failed,
+}
+
+/// Interpret the latest complete event; an incomplete log is never success.
+pub fn update_outcome(events: &[UpdateEvent]) -> UpdateOutcome {
+    match events.last() {
+        Some(event) if event.terminal && event.success => UpdateOutcome::Succeeded,
+        Some(event) if event.terminal => UpdateOutcome::Failed,
+        _ => UpdateOutcome::InProgress,
+    }
+}
+
 /// Validate an installed file against an authenticated SHA-256 digest.
 pub fn verify_file_sha256(path: &Path, expected: &str) -> Result<()> {
     verify_reader_sha256(File::open(path)?, expected)
@@ -550,15 +683,37 @@ pub fn verify_reader_sha256(mut file: impl Read, expected: &str) -> Result<()> {
     Ok(())
 }
 
-/// Wait for the updater to verify the request and retain the parent process handle.
+/// Wait up to three minutes for the updater to verify the request and retain the
+/// parent process handle. On timeout the updater is terminated while the host is
+/// still alive, so it cannot begin installation after the caller abandons it.
 pub fn wait_for_ready(child: &mut std::process::Child) -> Result<()> {
+    wait_for_ready_timeout(child, Duration::from_secs(180))
+}
+
+/// Like [`wait_for_ready`], with a caller-supplied deadline.
+pub fn wait_for_ready_timeout(child: &mut std::process::Child, timeout: Duration) -> Result<()> {
     let stdout = child
         .stdout
         .take()
         .ok_or(Error::Invalid("missing readiness pipe"))?;
-    let mut line = String::new();
-    use std::io::BufRead;
-    std::io::BufReader::new(stdout.take(16)).read_line(&mut line)?;
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        let mut line = String::new();
+        let result = std::io::BufReader::new(stdout.take(16)).read_line(&mut line);
+        let _ = sender.send(result.map(|_| line));
+    });
+    let line = match receiver.recv_timeout(timeout) {
+        Ok(result) => result?,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            child.kill()?;
+            child.wait()?;
+            return Err(Error::ReadinessTimeout);
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            return Err(Error::Invalid("readiness reader failed"));
+        }
+    };
     if line.trim_end_matches(['\r', '\n']) != "READY" {
         return Err(Error::Invalid("updater did not accept the request"));
     }

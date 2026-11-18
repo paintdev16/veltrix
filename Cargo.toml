@@ -1,3 +1,3 @@
 [workspace]
-members = ["crates/veltrix-core", "apps/veltrix", "examples/integration"]
+members = ["crates/veltrix-core", "apps/veltrix", "examples/integration", "tools/veltrix-sign"]
 resolver = "3"

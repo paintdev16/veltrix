@@ -1,0 +1,28 @@
+name: Prepare Windows artifact
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        shell: pwsh
+        run: |
+          $sdk = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\bin'
+          $fxc = Get-ChildItem $sdk -Directory | Where-Object { Test-Path (Join-Path $_.FullName 'x64\fxc.exe') } | Sort-Object { [version]$_.Name } -Descending | Select-Object -First 1
+          if (-not $fxc) { throw 'Windows SDK fxc.exe was not found' }
+          $env:GPUI_FXC_PATH = Join-Path $fxc.FullName 'x64\fxc.exe'
+          cargo build --release --locked -p veltrix
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          New-Item -ItemType Directory -Path dist | Out-Null
+          Copy-Item target/release/veltrix.exe dist/veltrix.exe
+          (Get-FileHash dist/veltrix.exe -Algorithm SHA256).Hash.ToLowerInvariant() + '  veltrix.exe' | Set-Content -Encoding ascii dist/SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: veltrix-windows-x86_64-unsigned
+          path: dist/
+          if-no-files-found: error

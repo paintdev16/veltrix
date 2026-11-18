@@ -6166,7 +6166,23 @@ name = "veltrix-integration-example"
 version = "0.1.0"
 dependencies = [
  "gpui-kit",
+ "hex",
+ "serde",
+ "serde_json",
+ "tempfile",
  "veltrix-core",
+]
+
+[[package]]
+name = "veltrix-sign"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek",
+ "hex",
+ "serde_json",
+ "tempfile",
+ "veltrix-core",
+ "zeroize",
 ]
 
 [[package]]
