@@ -28,6 +28,8 @@ struct Config {
     executable: String,
     channel: Channel,
     public_key: String,
+    #[serde(default)]
+    additional_public_keys: Vec<String>,
     max_package_size: u64,
 }
 
@@ -235,15 +237,29 @@ pub fn prepare() -> Result<Job> {
     safe_path(&request.job_dir, true)?;
     let version_file = root.join("version.txt");
     let current = version_at(&version_file)?;
+    ensure!(
+        config.additional_public_keys.len() <= 8,
+        "demasiadas claves confiables"
+    );
+    let mut trusted_keys = vec![
+        hex::decode(&config.public_key)?
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("clave Ed25519 inválida"))?,
+    ];
+    for key in &config.additional_public_keys {
+        trusted_keys.push(
+            hex::decode(key)?
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("clave Ed25519 inválida"))?,
+        );
+    }
     let policy = Policy {
         app_id: config.app_id,
         channel: config.channel,
         current_version: current.clone(),
         platform: "windows".into(),
         architecture: std::env::consts::ARCH.into(),
-        public_key: hex::decode(config.public_key)?
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("clave Ed25519 inválida"))?,
+        public_key: trusted_keys[0],
         max_package_size: config.max_package_size,
     };
     let job_file = |name: &str| -> Result<File> {
@@ -251,7 +267,9 @@ pub fn prepare() -> Result<Job> {
         safe_path(&path, false)?;
         Ok(File::open(path)?)
     };
-    let manifest = policy.verify_manifest(
+    let manifest = verify_with_keys(
+        &policy,
+        &trusted_keys,
         &read_limited(job_file("manifest.json")?, 1024 * 1024)?,
         &read_limited(job_file("manifest.sig")?, 64)?,
     )?;
@@ -265,7 +283,7 @@ pub fn prepare() -> Result<Job> {
         .to_owned();
 
     let source = job_file("package.exe")?;
-    let (rollback, rollback_warning) = match read_rollback(control, &policy) {
+    let (rollback, rollback_warning) = match read_rollback(control, &policy, &trusted_keys) {
         Ok(backup) => (backup, None),
         Err(error) => (None, Some(format!("{error:#}"))),
     };
@@ -295,7 +313,27 @@ pub fn prepare() -> Result<Job> {
     })
 }
 
-fn read_rollback(control: &Path, policy: &Policy) -> Result<Option<(File, VerifiedManifest)>> {
+fn verify_with_keys(
+    policy: &Policy,
+    keys: &[[u8; 32]],
+    bytes: &[u8],
+    signature: &[u8],
+) -> Result<VerifiedManifest> {
+    for key in keys {
+        let mut candidate = policy.clone();
+        candidate.public_key = *key;
+        if let Ok(manifest) = candidate.verify_manifest(bytes, signature) {
+            return Ok(manifest);
+        }
+    }
+    bail!("el manifiesto no cumple la política o su firma no coincide con las claves confiables")
+}
+
+fn read_rollback(
+    control: &Path,
+    policy: &Policy,
+    keys: &[[u8; 32]],
+) -> Result<Option<(File, VerifiedManifest)>> {
     let dir = control.join("rollback");
     match fs::symlink_metadata(&dir) {
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -311,7 +349,9 @@ fn read_rollback(control: &Path, policy: &Policy) -> Result<Option<(File, Verifi
     };
     let mut previous = policy.clone();
     previous.current_version = "0.0.0-0".parse()?;
-    let manifest = previous.verify_manifest(
+    let manifest = verify_with_keys(
+        &previous,
+        keys,
         &read_limited(open("manifest.json")?, 1024 * 1024)?,
         &read_limited(open("manifest.sig")?, 64)?,
     )?;
@@ -653,15 +693,20 @@ SectionEnd
         )
         .unwrap();
         assert_eq!(fs::read_to_string(user_data).unwrap(), "preserve me");
-        let result = Command::new(application)
+        let result = Command::new(&application)
             .arg("/?")
-            .current_dir(root)
+            .current_dir(&root)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
             .unwrap();
         assert!(result.success());
         drop(guard);
+        let marker = root.join("version.txt");
+        fs::write(&marker, "1.0.0").unwrap();
+        assert!(validate(&marker, &application, &target, &installed_hash).is_err());
+        fs::write(&marker, "2.0.0").unwrap();
+        assert!(validate(&marker, &application, &target, &"00".repeat(32)).is_err());
     }
 
     #[test]
