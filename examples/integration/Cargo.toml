@@ -1,0 +1,11 @@
+[package]
+name = "veltrix-integration-example"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+veltrix-core = { path = "../../crates/veltrix-core", version = "0.1.0" }
+
+[target.'cfg(windows)'.dependencies]
+gpui-kit = { version = "0.10.0", default-features = false }

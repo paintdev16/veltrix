@@ -1,0 +1,3 @@
+[workspace]
+members = ["crates/veltrix-core", "apps/veltrix", "examples/integration"]
+resolver = "3"
