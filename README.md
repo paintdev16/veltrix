@@ -123,7 +123,7 @@ Puede aprovisionar un instalador anterior y sus archivos `manifest.json`, `manif
 - Se valida el ejecutable principal y el marcador local de versión. La consistencia de los demás archivos y de los datos de usuario depende del instalador de cada aplicación. Sin respaldo no hay reversión de cambios parciales.
 - El control de rutas y la copia protegida dependen de que el árbol de instalación y el directorio de trabajo estén protegidos contra otras cuentas. El diseño no aísla aplicaciones maliciosas con los mismos permisos ni instaladores firmados que incumplan el contrato.
 - Los parches incrementales y los ejecutables para Linux y macOS quedan pendientes.
-- El ejemplo GPUI inicia la búsqueda mediante `--update`, sin controles de selección ni cancelación. No hay selección de parches ni publicación automatizada de releases. El workflow manual de artefactos produce un ejecutable sin firma Authenticode; la firma y la publicación quedan a cargo del proceso de distribución.
+- El ejemplo GPUI inicia la búsqueda mediante `--update`, sin controles de selección ni cancelación. No hay selección de parches. El workflow de releases (`v*`) publica un ejecutable sin firma Authenticode junto con `SHA256SUMS.txt`; la firma Authenticode queda a cargo del proceso de distribución.
 
 
 

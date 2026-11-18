@@ -1,8 +1,11 @@
-name: Prepare Windows artifact
+name: Release Windows artifact
 on:
+  push:
+    tags:
+      - 'v*'
   workflow_dispatch:
 permissions:
-  contents: read
+  contents: write
 jobs:
   build:
     runs-on: windows-latest
@@ -18,7 +21,7 @@ jobs:
           $env:GPUI_FXC_PATH = Join-Path $fxc.FullName 'x64\fxc.exe'
           cargo build --release --locked -p veltrix
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          New-Item -ItemType Directory -Path dist | Out-Null
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
           Copy-Item target/release/veltrix.exe dist/veltrix.exe
           (Get-FileHash dist/veltrix.exe -Algorithm SHA256).Hash.ToLowerInvariant() + '  veltrix.exe' | Set-Content -Encoding ascii dist/SHA256SUMS.txt
       - uses: actions/upload-artifact@v4
@@ -26,3 +29,23 @@ jobs:
           name: veltrix-windows-x86_64-unsigned
           path: dist/
           if-no-files-found: error
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          $isPrerelease = $tag -match '-'
+          $ErrorActionPreference = 'Continue'
+          gh release view $tag *>$null
+          $exists = ($LASTEXITCODE -eq 0)
+          $ErrorActionPreference = 'Stop'
+          if ($exists) {
+            gh release upload $tag dist/veltrix.exe dist/SHA256SUMS.txt --clobber
+          } else {
+            $ghArgs = @('release', 'create', $tag, 'dist/veltrix.exe', 'dist/SHA256SUMS.txt', '--title', $tag, '--generate-notes')
+            if ($isPrerelease) { $ghArgs += '--prerelease' }
+            gh @ghArgs
+          }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
