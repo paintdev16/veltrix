@@ -10,8 +10,12 @@ use std::{
     },
     path::{Component, Path, PathBuf, Prefix},
     process::{Command, Stdio},
+    time::{Duration, Instant},
 };
-use veltrix_core::{Channel, Policy, UpdateEvent, UpdateRequest, VerifiedManifest};
+use veltrix_core::{
+    CONFIRMED_STARTUP_PROTOCOL, Channel, LEGACY_PROTOCOL, Policy, STARTUP_ACK_ENV, UpdateEvent,
+    UpdateRequest, VerifiedManifest,
+};
 use windows_sys::Win32::{
     Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT},
     System::Threading::{
@@ -47,7 +51,9 @@ pub struct Job {
     manifest: VerifiedManifest,
     rollback: Option<(File, VerifiedManifest)>,
     rollback_warning: Option<String>,
+    confirm_restart: bool,
     _lock: File,
+    _directories: [File; 3],
     installed_hash: String,
     log: File,
 }
@@ -135,6 +141,21 @@ fn safe_name(name: &str) -> bool {
     })
 }
 
+fn retained_directory(path: &Path) -> Result<File> {
+    safe_path(path, true)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .share_mode(3) // Do not allow rename or deletion while in use.
+        .custom_flags(0x0220_0000) // BACKUP_SEMANTICS | OPEN_REPARSE_POINT
+        .open(path)?;
+    let metadata = file.metadata()?;
+    ensure!(
+        metadata.is_dir() && metadata.file_attributes() & 0x400 == 0,
+        "directorio protegido no válido"
+    );
+    Ok(file)
+}
+
 fn version_at(path: &Path) -> Result<Version> {
     safe_path(path, false)?;
     Ok(std::str::from_utf8(&read_limited(File::open(path)?, 256)?)?
@@ -194,7 +215,13 @@ impl Drop for Parent {
 pub fn prepare() -> Result<Job> {
     let input = read_limited(io::stdin().lock(), 16 * 1024)?;
     let request: UpdateRequest = serde_json::from_slice(&input)?;
-    ensure!(request.protocol == 1, "protocolo incompatible");
+    ensure!(
+        matches!(
+            request.protocol,
+            LEGACY_PROTOCOL | CONFIRMED_STARTUP_PROTOCOL
+        ),
+        "protocolo incompatible"
+    );
 
     let updater = std::env::current_exe()?;
     safe_path(&updater, false)?;
@@ -213,6 +240,11 @@ pub fn prepare() -> Result<Job> {
         root.parent().is_some(),
         "la instalación no puede estar en la raíz"
     );
+    let directories = [
+        retained_directory(&root)?,
+        retained_directory(control)?,
+        retained_directory(&request.job_dir)?,
+    ];
     let config_file = control.join("app.json");
     safe_path(&config_file, false)?;
     let config: Config =
@@ -229,7 +261,16 @@ pub fn prepare() -> Result<Job> {
     safe_path(&executable, false)?;
     let lock_path = control.join("update.lock");
     safe_path(&lock_path, false)?;
-    let lock = OpenOptions::new().read(true).write(true).open(lock_path)?;
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .share_mode(3)
+        .custom_flags(0x0020_0000) // OPEN_REPARSE_POINT
+        .open(lock_path)?;
+    ensure!(
+        lock.metadata()?.file_attributes() & 0x400 == 0,
+        "bloqueo no válido"
+    );
     lock.try_lock()
         .context("ya hay otra actualización en curso")?;
 
@@ -307,7 +348,9 @@ pub fn prepare() -> Result<Job> {
         manifest,
         rollback,
         rollback_warning,
+        confirm_restart: request.protocol == CONFIRMED_STARTUP_PROTOCOL,
         _lock: lock,
+        _directories: directories,
         installed_hash,
         log,
     })
@@ -456,6 +499,68 @@ fn validate(
     Ok(guard)
 }
 
+fn wait_for_startup(child: &mut std::process::Child, ack: &Path, timeout: Duration) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            bail!("la aplicación se cerró antes de confirmar el arranque: {status}");
+        }
+        match fs::symlink_metadata(ack) {
+            Ok(meta) => {
+                ensure!(
+                    meta.is_file() && meta.len() == 0 && meta.file_attributes() & 0x400 == 0,
+                    "confirmación de arranque no válida"
+                );
+                return Ok(());
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "la aplicación no confirmó el arranque dentro del plazo"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn restart(
+    executable: &Path,
+    root: &Path,
+    ack: Option<&Path>,
+    can_restore: &mut bool,
+) -> Result<()> {
+    let mut command = Command::new(executable);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .current_dir(root);
+    command.env_remove(STARTUP_ACK_ENV);
+    if let Some(ack) = ack {
+        command.env(STARTUP_ACK_ENV, ack);
+    }
+    let mut child = command.spawn()?;
+    if let Some(ack) = ack
+        && let Err(error) = wait_for_startup(&mut child, ack, Duration::from_secs(30))
+    {
+        // Never run the recovery installer while the new binary may still hold files.
+        *can_restore = false;
+        let stopped = child.try_wait().and_then(|status| {
+            if status.is_none() {
+                child.kill()?;
+                child.wait()?;
+            }
+            Ok(())
+        });
+        *can_restore = stopped.is_ok();
+        if let Err(stop) = stopped {
+            bail!("{error:#}. No se pudo detener el proceso para recuperar la instalación: {stop}");
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
 impl Job {
     pub fn run(mut self, show: impl Fn(&UpdateEvent)) -> bool {
         let mut emit =
@@ -498,6 +603,31 @@ impl Job {
                     progress: (done < total).then_some((done, total)),
                 });
             })?;
+            let backup = if let Some((source, manifest)) = self.rollback {
+                let verified = stage(&self.control, source, &manifest, |_, _| {});
+                match verified {
+                    Ok(backup) => Some((backup, manifest)),
+                    Err(error) => {
+                        emit("Respaldo no disponible", format!("{error:#}"), false, false)?;
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            let startup_dir = self
+                .confirm_restart
+                .then(|| {
+                    tempfile::Builder::new()
+                        .prefix("startup-")
+                        .tempdir_in(&self.control)
+                })
+                .transpose()?;
+            let _startup_guard = startup_dir
+                .as_ref()
+                .map(|dir| retained_directory(dir.path()))
+                .transpose()?;
+            let ack = startup_dir.as_ref().map(|dir| dir.path().join("ready"));
             emit(
                 "Esperando cierre de la aplicación",
                 "Cierra la aplicación para continuar.".into(),
@@ -516,68 +646,81 @@ impl Job {
                 false,
                 false,
             )?;
-            let installation = install(&staged, &self.root).and_then(|()| {
+            let mut can_restore = true;
+            let installation = (|| -> Result<()> {
+                install(&staged, &self.root)?;
                 emit(
                     "Validando instalación",
                     "Comprobando la versión y el ejecutable instalado.".into(),
                     false,
                     false,
                 )?;
-                validate(
+                let _restart_guard = validate(
                     &self.version_file,
                     &self.executable,
                     &self.target,
                     &self.installed_hash,
-                )
-            });
-            let restart_guard = match installation {
-                Ok(guard) => guard,
-                Err(error) => {
-                    if let Some((source, backup)) = self.rollback {
-                        let restore = (|| -> Result<()> {
-                            emit(
-                                "Restaurando instalación",
-                                "Verificando y aplicando el respaldo firmado.".into(),
-                                false,
-                                false,
-                            )?;
-                            let old = stage(&self.control, source, &backup, |_, _| {})?;
-                            install(&old, &self.root)?;
-                            validate(
-                                &self.version_file,
-                                &self.executable,
-                                &self.current,
-                                backup
-                                    .manifest()
-                                    .installed_sha256
-                                    .as_deref()
-                                    .context("falta el hash firmado del respaldo")?,
-                            )
-                            .map(drop)
-                        })();
-                        match restore {
-                            Ok(()) => bail!("{error:#}. Se restauró la versión {}.", self.current),
-                            Err(restore) => bail!("{error:#}. La recuperación falló: {restore:#}"),
-                        }
+                )?;
+                emit(
+                    "Reiniciando aplicación",
+                    if self.confirm_restart {
+                        "Esperando la confirmación de arranque."
+                    } else {
+                        "Abriendo la versión actualizada."
                     }
-                    return Err(error);
+                    .into(),
+                    false,
+                    false,
+                )?;
+                restart(
+                    &self.executable,
+                    &self.root,
+                    ack.as_deref(),
+                    &mut can_restore,
+                )
+            })();
+            if let Err(error) = installation {
+                if can_restore && let Some((old, backup)) = backup {
+                    let restore = (|| -> Result<()> {
+                        emit(
+                            "Restaurando instalación",
+                            "Verificando y aplicando el respaldo firmado.".into(),
+                            false,
+                            false,
+                        )?;
+                        install(&old, &self.root)?;
+                        validate(
+                            &self.version_file,
+                            &self.executable,
+                            &self.current,
+                            backup
+                                .manifest()
+                                .installed_sha256
+                                .as_deref()
+                                .context("falta el hash firmado del respaldo")?,
+                        )
+                        .map(drop)
+                    })();
+                    match restore {
+                        Ok(()) => bail!("{error:#}. Se restauró la versión {}.", self.current),
+                        Err(restore) => bail!("{error:#}. La recuperación falló: {restore:#}"),
+                    }
                 }
-            };
-            emit(
-                "Reiniciando aplicación",
-                "Abriendo la versión actualizada.".into(),
-                false,
-                false,
-            )?;
-            Command::new(&self.executable)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .current_dir(&self.root)
-                .spawn()?;
-            drop(restart_guard);
+                return Err(error);
+            }
             emit(
                 "Actualización completada",
-                format!("La versión {} está instalada.", self.target),
+                if self.confirm_restart {
+                    format!(
+                        "La versión {} está instalada y confirmó el arranque.",
+                        self.target
+                    )
+                } else {
+                    format!(
+                        "La versión {} está instalada. El protocolo anterior verifica solo el lanzamiento.",
+                        self.target
+                    )
+                },
                 true,
                 true,
             )?;

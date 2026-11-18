@@ -19,6 +19,7 @@ Para probar un instalador NSIS real con un paquete firmado de prueba, indique d�
 ```powershell
 $env:MAKENSIS = 'C:\Program Files (x86)\NSIS\makensis.exe'
 cargo test --locked -p veltrix signed_nsis_update_writes_only_to_chosen_installation -- --ignored
+cargo test --locked -p veltrix --test windows_e2e -- --ignored --test-threads=1
 ```
 
 ## Distribuir la aplicación
@@ -95,7 +96,7 @@ fn prepare_update(
     })?;
 
     let request = UpdateRequest {
-        protocol: 1,
+        protocol: veltrix_core::CONFIRMED_STARTUP_PROTOCOL,
         app_id: policy.app_id.clone(),
         parent_pid: std::process::id(),
         job_dir: job.to_owned(),
@@ -107,9 +108,13 @@ fn prepare_update(
 }
 ```
 
-El actualizador valida la identidad del proceso y conserva un handle hasta que se cierra. Permite hasta dos minutos después de responder `READY`. `wait_for_ready` espera hasta tres minutos y termina el actualizador si no responde; `wait_for_ready_timeout` permite especificar otro plazo. La aplicación integradora debe mantener vivo el proceso hasta que termine esta llamada, cerrar también sus procesos auxiliares y coordinar su arranque para evitar nuevas instancias durante la instalación. Use `read_update_events` y `update_outcome` con el directorio del intento para consultar los eventos JSONL. Un resultado `Succeeded` confirma la validación y que Windows aceptó el lanzamiento del nuevo binario; no confirma que la aplicación haya terminado de arrancar correctamente. Los errores anteriores a la apertura del registro salen por stderr.
+El actualizador conserva un handle del proceso original y espera hasta dos minutos después de responder `READY`. `wait_for_ready` espera hasta tres minutos antes de detener el actualizador. La aplicación integradora debe cerrar sus procesos auxiliares y evitar nuevas instancias durante la instalación.
 
-Puede aprovisionar un instalador anterior y sus archivos `manifest.json`, `manifest.sig` y `package.exe` en `.updater/rollback`. Deben pertenecer a la versión instalada y pasar las mismas comprobaciones criptográficas. Si NSIS falla o el ejecutable instalado no coincide con la versión y el hash esperados, el actualizador intenta restaurar esa versión y sigue informando un fallo de actualización. El instalador de respaldo debe poder reparar una instalación parcial y dejar los datos del usuario intactos.
+Con el protocolo 2, la versión relanzada debe llamar a `veltrix_core::confirm_startup()` después de inicializar su estado esencial y su ventana. En arranques ordinarios devuelve `Ok(false)`. El actualizador espera hasta 30 segundos y registra éxito solo cuando recibe la confirmación mientras el proceso sigue vivo. Si vence el plazo, detiene el proceso que lanzó antes de intentar restaurar. Posponga la creación de procesos auxiliares hasta después de confirmar. Use `read_update_events` y `update_outcome` para leer el resultado.
+
+El protocolo 1 sigue aceptado para aplicaciones como Dylan con la integración anterior. Su resultado registra la creación del proceso. La etiqueta [v0.1.1](https://github.com/paintdev16/veltrix/releases/tag/v0.1.1) conserva el binario originalmente publicado como beta y requiere el protocolo 1. Active el protocolo 2 cuando distribuya un nuevo actualizador que lo admita y una aplicación que confirme el arranque. Consulte [la publicación actual](https://github.com/paintdev16/veltrix/releases/latest) para descargas.
+
+Puede aprovisionar un instalador anterior y sus archivos `manifest.json`, `manifest.sig` y `package.exe` en `.updater/rollback`. Deben pertenecer a la versión instalada. El actualizador verifica y prepara una copia protegida del respaldo antes de cerrar la aplicación. Ante un fallo de instalación, validación o arranque, intenta restaurar la versión anterior y verifica su versión y hash. El resultado de la actualización sigue siendo fallido aunque se recupere la instalación. El respaldo debe poder reparar una instalación parcial sin sustituir los datos del usuario. Tras restaurar, abra la aplicación manualmente.
 
 ## Límites de la versión inicial
 

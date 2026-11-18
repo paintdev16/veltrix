@@ -618,6 +618,27 @@ pub struct UpdateRequest {
     pub job_dir: std::path::PathBuf,
 }
 
+/// Handoff protocol supported by existing hosts. It verifies process creation only.
+pub const LEGACY_PROTOCOL: u32 = 1;
+/// Handoff protocol requiring the relaunched application to report readiness.
+pub const CONFIRMED_STARTUP_PROTOCOL: u32 = 2;
+/// Environment variable passed to the application only during a confirmed restart.
+pub const STARTUP_ACK_ENV: &str = "VELTRIX_STARTUP_ACK";
+
+/// Call once after the main window and essential application state are ready.
+/// Returns false during ordinary launches. Do not call this at process entry.
+pub fn confirm_startup() -> Result<bool> {
+    let Some(path) = std::env::var_os(STARTUP_ACK_ENV) else {
+        return Ok(false);
+    };
+    let path = Path::new(&path);
+    if !path.is_absolute() || path.file_name().and_then(|name| name.to_str()) != Some("ready") {
+        return Err(Error::Invalid("invalid startup acknowledgement path"));
+    }
+    OpenOptions::new().write(true).create_new(true).open(path)?;
+    Ok(true)
+}
+
 impl UpdateRequest {
     /// Launch the trusted updater and send a handoff. Read one line from the
     /// returned child's stdout and exit only after receiving "READY".
@@ -663,7 +684,8 @@ pub struct UpdateEvent {
     pub progress: Option<(u64, u64)>,
 }
 
-/// Persisted result of an update attempt. A launched process is not a health check.
+/// Persisted result of an update attempt. Startup acknowledgement is required
+/// for success when the host requests protocol 2.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpdateOutcome {
     InProgress,

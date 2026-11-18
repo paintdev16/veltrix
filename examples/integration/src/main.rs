@@ -112,6 +112,10 @@ fn main() {
         })
         .detach();
         cx.activate(true);
+        if let Err(error) = veltrix_core::confirm_startup() {
+            eprintln!("No se pudo confirmar el arranque: {error}");
+            cx.quit();
+        }
     });
 }
 
@@ -249,7 +253,7 @@ fn prepare_update(
         progress,
     )?;
     let request = UpdateRequest {
-        protocol: 1,
+        protocol: veltrix_core::CONFIRMED_STARTUP_PROTOCOL,
         app_id: policy.app_id.clone(),
         parent_pid: std::process::id(),
         job_dir: job.to_owned(),

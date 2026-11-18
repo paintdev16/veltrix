@@ -41,7 +41,28 @@ impl Fixture {
         fs::create_dir_all(&control).unwrap();
         fs::create_dir(&job).unwrap();
         let source = dir.path().join("host.rs");
-        fs::write(&source, r#"fn main() { if std::env::args().any(|a| a == "--hold") { loop { std::thread::sleep(std::time::Duration::from_secs(1)); } } else { let exe = std::env::current_exe().unwrap(); std::fs::write(exe.parent().unwrap().join("restarted.txt"), b"started").unwrap(); } }"#).unwrap();
+        fs::write(
+            &source,
+            r#"
+fn main() {
+    if std::env::args().any(|arg| arg == "--hold") {
+        loop { std::thread::sleep(std::time::Duration::from_secs(1)); }
+    }
+    let exe = std::env::current_exe().unwrap();
+    let root = exe.parent().unwrap();
+    if root.join("crash-on-restart").exists() { std::process::exit(7); }
+    if root.join("stall-on-restart").exists() {
+        loop { std::thread::sleep(std::time::Duration::from_secs(1)); }
+    }
+    std::fs::write(root.join("restarted.txt"), b"started").unwrap();
+    if let Some(path) = std::env::var_os("VELTRIX_STARTUP_ACK") {
+        std::fs::OpenOptions::new().write(true).create_new(true).open(path).unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+}
+"#,
+        )
+        .unwrap();
         let app = root.join("App.exe");
         let result = Command::new("rustc")
             .args(["--edition", "2024"])
@@ -77,7 +98,7 @@ impl Fixture {
         fs::write(dir.join("app.exe"), &self.app_bytes).unwrap();
         fs::write(dir.join("version.txt"), version).unwrap();
         let action = if fail {
-            "SetErrorLevel 7\n    Quit"
+            "SetOutPath \"$INSTDIR\"\n    File /oname=version.txt \"version.txt\"\n    SetErrorLevel 7\n    Quit"
         } else {
             "SetOutPath \"$INSTDIR\"\n    File /oname=App.exe \"app.exe\"\n    File /oname=version.txt \"version.txt\""
         };
@@ -108,6 +129,10 @@ impl Fixture {
     }
 
     fn launch(&self) -> (Process, Process, mpsc::Receiver<String>) {
+        self.launch_with_protocol(veltrix_core::CONFIRMED_STARTUP_PROTOCOL)
+    }
+
+    fn launch_with_protocol(&self, protocol: u32) -> (Process, Process, mpsc::Receiver<String>) {
         let host = Process(
             Command::new(self.root.join("App.exe"))
                 .arg("--hold")
@@ -125,7 +150,7 @@ impl Fixture {
                 .unwrap(),
         );
         let request = UpdateRequest {
-            protocol: 1,
+            protocol,
             app_id: "org.example.e2e".into(),
             parent_pid: host.0.id(),
             job_dir: self.job.clone(),
@@ -179,6 +204,7 @@ fn full_update_waits_installs_and_restarts() {
     host.0.wait().unwrap();
     let event = f.terminal();
     assert!(event.success, "{}", event.message);
+    assert!(event.message.contains("confirmó el arranque"));
     assert_eq!(
         fs::read_to_string(f.root.join("version.txt")).unwrap(),
         "2.0.0"
@@ -192,6 +218,24 @@ fn full_update_waits_installs_and_restarts() {
         thread::sleep(Duration::from_millis(50));
     }
     assert!(f.root.join("restarted.txt").exists());
+}
+
+#[test]
+#[ignore = "requires MAKENSIS and a Windows desktop"]
+fn legacy_host_can_still_update_without_startup_ack() {
+    let f = Fixture::new();
+    let package = f.installer(&f.dir.path().join("build"), "2.0.0", false);
+    f.signed_package(&f.job, &package, "2.0.0");
+    let (mut host, _updater, ready) = f.launch_with_protocol(veltrix_core::LEGACY_PROTOCOL);
+    assert_eq!(
+        ready.recv_timeout(Duration::from_secs(30)).unwrap().trim(),
+        "READY"
+    );
+    host.0.kill().unwrap();
+    host.0.wait().unwrap();
+    let event = f.terminal();
+    assert!(event.success, "{}", event.message);
+    assert!(event.message.contains("verifica solo el lanzamiento"));
 }
 
 #[test]
@@ -219,6 +263,45 @@ fn failed_install_restores_signed_backup_and_reports_failure() {
     assert_eq!(
         fs::read_to_string(f.root.join("user-data.txt")).unwrap(),
         "keep this"
+    );
+}
+
+fn failed_startup_restores_backup(marker: &str, message: &str) {
+    let f = Fixture::new();
+    fs::write(f.root.join(marker), []).unwrap();
+    let update = f.installer(&f.dir.path().join("build"), "2.0.0", false);
+    let backup = f.installer(&f.dir.path().join("old"), "1.0.0", false);
+    f.signed_package(&f.job, &update, "2.0.0");
+    f.signed_package(&f.root.join(".updater/rollback"), &backup, "1.0.0");
+    let (mut host, _updater, ready) = f.launch();
+    assert_eq!(
+        ready.recv_timeout(Duration::from_secs(30)).unwrap().trim(),
+        "READY"
+    );
+    host.0.kill().unwrap();
+    host.0.wait().unwrap();
+    let event = f.terminal();
+    assert!(!event.success);
+    assert!(event.message.contains(message), "{}", event.message);
+    assert!(event.message.contains("Se restauró"), "{}", event.message);
+    assert_eq!(
+        fs::read_to_string(f.root.join("version.txt")).unwrap(),
+        "1.0.0"
+    );
+}
+
+#[test]
+#[ignore = "requires MAKENSIS and a Windows desktop"]
+fn restart_crash_restores_signed_backup() {
+    failed_startup_restores_backup("crash-on-restart", "se cerró antes de confirmar");
+}
+
+#[test]
+#[ignore = "requires MAKENSIS and a Windows desktop"]
+fn restart_timeout_stops_child_and_restores_signed_backup() {
+    failed_startup_restores_backup(
+        "stall-on-restart",
+        "no confirmó el arranque dentro del plazo",
     );
 }
 
