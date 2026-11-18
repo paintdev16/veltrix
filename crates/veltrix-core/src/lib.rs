@@ -528,6 +528,18 @@ mod tests {
         );
     }
     #[test]
+    #[ignore = "requires access to the public GitHub API"]
+    fn live_github_release_query() {
+        let repository = std::env::var("VELTRIX_TEST_REPOSITORY")
+            .unwrap_or_else(|_| "paintdev16/veltrix".into());
+        let (owner, name) = repository.split_once('/').expect("owner/repository");
+        let releases = github_releases(&http_client().unwrap(), owner, name).unwrap();
+        eprintln!(
+            "GitHub returned {} release(s) for {repository}",
+            releases.len()
+        );
+    }
+    #[test]
     fn version_and_channel() {
         let (mut p, b, s) = fixture();
         p.current_version = Version::parse("2.0.0").unwrap();
