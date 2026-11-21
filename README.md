@@ -78,6 +78,8 @@ El instalador debe admitir `/S` y respetar el `/D` que recibe, devolver un códi
 
 En **Linux**, utilice la misma estructura dentro de un directorio propiedad del usuario sin permisos de escritura para grupo ni otros (`chmod 0700` o `0755`), con el binario ejecutable (`MyApp`), `.updater/veltrix` (`chmod 0755`) y paquetes firmados `package.tar.gz` (`update-linux-x86_64.json` y `update-linux-x86_64.json.sig`). El archivo `.tar.gz` debe contener los archivos de la aplicación y `version.txt`, sin enlaces simbólicos ni entradas dentro de `.updater/`. Veltrix extrae los archivos de forma atómica, preserva los permisos de ejecución y actualiza `version.txt` al final.
 
+Veltrix crea sus directorios temporales `stage-*` y `startup-*` con modo `0700`. El integrador debe crear el directorio de trabajo con modo `0700` y usar `0644` o `0600` para `update.lock`. Los rechazos por permisos o propietario indican la ruta, el UID y el modo detectados. Ejecute el instalador y la aplicación con el mismo usuario habitual.
+
 ## Publicar un release
 
 Etiquete con SemVer, con prefijo `v` opcional. Stable admite versiones finales. Beta admite identificadores `beta`, `beta.*` y `beta-*`. Nightly usa las mismas reglas con `nightly`. Marque beta y nightly como prereleases en GitHub. La selección ignora borradores y usa precedencia SemVer, incluidos los números de prerelease.

@@ -60,14 +60,17 @@ fn current_uid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
-fn check_protected(meta: &fs::Metadata) -> Result<()> {
+fn check_protected(path: &Path, meta: &fs::Metadata) -> Result<()> {
+    let uid = current_uid();
+    let owner = meta.uid();
+    let mode = meta.mode() & 0o7777;
     ensure!(
-        meta.uid() == current_uid(),
-        "el recurso no pertenece al usuario actual"
+        owner == uid,
+        "el recurso no pertenece al usuario actual: ruta={path:?}, uid={owner}, uid esperado={uid}, modo={mode:04o}"
     );
     ensure!(
-        meta.mode() & 0o022 == 0,
-        "permisos inseguros: escritura permitida para grupo u otros"
+        mode & 0o022 == 0,
+        "permisos inseguros: escritura permitida para grupo u otros: ruta={path:?}, uid={owner}, modo={mode:04o}"
     );
     Ok(())
 }
@@ -108,7 +111,7 @@ fn safe_path(path: &Path, folder: bool) -> Result<()> {
             let meta = fs::symlink_metadata(&cursor)?;
             ensure!(
                 !meta.file_type().is_symlink(),
-                "no se permiten enlaces simbólicos"
+                "no se permiten enlaces simbólicos: {cursor:?}"
             );
             ensure!(
                 meta.is_dir() || cursor == path,
@@ -150,8 +153,30 @@ fn retained_directory(path: &Path) -> Result<File> {
         .open(path)?;
     let metadata = file.metadata()?;
     ensure!(metadata.is_dir(), "directorio protegido no válido");
-    check_protected(&metadata)?;
+    check_protected(path, &metadata)?;
     Ok(file)
+}
+
+fn private_tempdir(parent: &Path, prefix: &str) -> Result<(tempfile::TempDir, File)> {
+    safe_path(parent, true)?;
+    // Request private permissions at creation, before any other process can access it.
+    let dir = tempfile::Builder::new()
+        .prefix(prefix)
+        .permissions(Permissions::from_mode(0o700))
+        .tempdir_in(parent)
+        .with_context(|| {
+            format!("no se pudo crear el directorio temporal {prefix} en {parent:?}")
+        })?;
+    let guard = retained_directory(dir.path())?;
+    let metadata = guard.metadata()?;
+    let mode = metadata.mode() & 0o7777;
+    ensure!(
+        mode == 0o700,
+        "el directorio temporal debe ser privado: ruta={:?}, uid={}, modo={mode:04o}, esperado=0700",
+        dir.path(),
+        metadata.uid()
+    );
+    Ok((dir, guard))
 }
 
 fn version_at(path: &Path) -> Result<Version> {
@@ -267,10 +292,10 @@ pub fn prepare() -> Result<Job> {
         .read(true)
         .write(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(lock_path)?;
+        .open(&lock_path)?;
     let lock_meta = lock.metadata()?;
     ensure!(lock_meta.is_file(), "bloqueo no válido");
-    check_protected(&lock_meta)?;
+    check_protected(&lock_path, &lock_meta)?;
     lock.try_lock()
         .context("ya hay otra actualización en curso")?;
 
@@ -424,10 +449,7 @@ fn stage(
     manifest: &VerifiedManifest,
     progress: impl Fn(u64, u64),
 ) -> Result<Staged> {
-    safe_path(control, true)?;
-    let dir = tempfile::Builder::new()
-        .prefix("stage-")
-        .tempdir_in(control)?;
+    let (dir, _directory_guard) = private_tempdir(control, "stage-")?;
     let package = dir.path().join(PACKAGE_FILENAME);
     let mut output = OpenOptions::new()
         .write(true)
@@ -615,7 +637,7 @@ fn validate(
     );
     let guard = open_regular_nofollow(executable)?;
     let meta = guard.metadata()?;
-    check_protected(&meta)?;
+    check_protected(executable, &meta)?;
     ensure!(
         meta.mode() & 0o100 != 0,
         "el ejecutable instalado no tiene permisos de ejecución"
@@ -742,17 +764,11 @@ impl Job {
             };
             let startup_dir = self
                 .confirm_restart
-                .then(|| {
-                    tempfile::Builder::new()
-                        .prefix("startup-")
-                        .tempdir_in(&self.control)
-                })
+                .then(|| private_tempdir(&self.control, "startup-"))
                 .transpose()?;
-            let _startup_guard = startup_dir
+            let ack = startup_dir
                 .as_ref()
-                .map(|dir| retained_directory(dir.path()))
-                .transpose()?;
-            let ack = startup_dir.as_ref().map(|dir| dir.path().join("ready"));
+                .map(|(dir, _guard)| dir.path().join("ready"));
             emit(
                 "Esperando cierre de la aplicación",
                 "Cierra la aplicación para continuar.".into(),

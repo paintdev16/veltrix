@@ -5,8 +5,8 @@ use flate2::{Compression, write::GzEncoder};
 use sha2::{Digest, Sha256};
 use std::{
     fs::{self, Permissions},
-    io::{BufRead, BufReader, Write},
-    os::unix::fs::PermissionsExt,
+    io::{BufRead, BufReader, Read, Write},
+    os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::mpsc,
@@ -178,11 +178,13 @@ fn main() {
                 .unwrap(),
         );
         let mut updater = Process(
-            Command::new(&self.updater)
+            Command::new("sh")
+                .args(["-c", "umask 000; exec \"$@\"", "veltrix-e2e"])
+                .arg(&self.updater)
                 .env("VELTRIX_HEADLESS", "1")
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
-                .stderr(Stdio::null())
+                .stderr(Stdio::piped())
                 .spawn()
                 .unwrap(),
         );
@@ -224,7 +226,26 @@ fn main() {
 
 #[test]
 fn full_update_waits_installs_and_restarts() {
+    exercise_full_update(0o700, 0o600);
+}
+
+#[test]
+fn full_update_supports_dylan_installer_permissions() {
+    exercise_full_update(0o755, 0o644);
+}
+
+fn exercise_full_update(install_mode: u32, lock_mode: u32) {
     let f = Fixture::new();
+    let control = f.root.join(".updater");
+    for path in [&f.root, &control] {
+        fs::set_permissions(path, Permissions::from_mode(install_mode)).unwrap();
+    }
+    fs::set_permissions(
+        control.join("update.lock"),
+        Permissions::from_mode(lock_mode),
+    )
+    .unwrap();
+    fs::set_permissions(control.join("app.json"), Permissions::from_mode(0o644)).unwrap();
     let package = f.package(&f.dir.path().join("build"), "2.0.0", false);
     f.signed_package(&f.job, &package, "2.0.0");
     let (mut host, _updater, ready) = f.launch();
@@ -232,6 +253,18 @@ fn full_update_waits_installs_and_restarts() {
         ready.recv_timeout(Duration::from_secs(30)).unwrap().trim(),
         "READY"
     );
+    for prefix in ["stage-", "startup-"] {
+        let path = fs::read_dir(&control)
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .find(|entry| entry.file_name().to_string_lossy().starts_with(prefix))
+            .unwrap_or_else(|| panic!("missing {prefix} directory"))
+            .path();
+        let metadata = fs::symlink_metadata(&path).unwrap();
+        assert!(metadata.is_dir());
+        assert_eq!(metadata.mode() & 0o7777, 0o700, "{path:?}");
+        assert_eq!(metadata.uid(), fs::metadata(&control).unwrap().uid());
+    }
     assert_eq!(
         fs::read_to_string(f.root.join("version.txt")).unwrap(),
         "1.0.0"
@@ -254,6 +287,33 @@ fn full_update_waits_installs_and_restarts() {
         thread::sleep(Duration::from_millis(50));
     }
     assert!(f.root.join("restarted.txt").exists());
+}
+
+#[test]
+fn rejects_insecure_job_directory_with_path_owner_and_mode() {
+    let f = Fixture::new();
+    fs::set_permissions(&f.job, Permissions::from_mode(0o775)).unwrap();
+    let (_host, mut updater, ready) = f.launch();
+    assert_eq!(
+        ready.recv_timeout(Duration::from_secs(30)).unwrap().trim(),
+        "ERROR"
+    );
+    let mut diagnostic = String::new();
+    updater
+        .0
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut diagnostic)
+        .unwrap();
+    assert!(!updater.0.wait().unwrap().success());
+    assert!(diagnostic.contains("permisos inseguros"), "{diagnostic}");
+    assert!(diagnostic.contains(&format!("{:?}", f.job)), "{diagnostic}");
+    assert!(
+        diagnostic.contains(&format!("uid={}", fs::metadata(&f.job).unwrap().uid())),
+        "{diagnostic}"
+    );
+    assert!(diagnostic.contains("modo=0775"), "{diagnostic}");
 }
 
 #[test]
