@@ -1,8 +1,8 @@
 use crate::windows::Job;
 use gpui_kit::{
-    App, Bounds, Context, FontWeight, Hsla, MouseButton, Render, TitlebarOptions, Window,
-    WindowAppearance, WindowBounds, WindowControlArea, WindowOptions, div, img, linear_color_stop,
-    linear_gradient, prelude::*, px, relative, rgb, rgba, size,
+    App, Bounds, Context, FontWeight, Hsla, MouseButton, PathBuilder, Render, TitlebarOptions,
+    Window, WindowAppearance, WindowBounds, WindowControlArea, WindowOptions, canvas, div, img,
+    linear_color_stop, linear_gradient, point, prelude::*, px, relative, rgb, rgba, size,
 };
 use std::{
     path::PathBuf,
@@ -14,15 +14,9 @@ use std::{
 };
 use veltrix_core::UpdateEvent;
 
-const STEPS: [&str; 5] = [
-    "Preparar",
-    "Cerrar aplicación",
-    "Aplicar",
-    "Verificar",
-    "Reiniciar",
-];
-
-const INDETERMINATE_WIDTH: f32 = 0.28;
+const INDETERMINATE_WIDTH: f32 = 0.36;
+const TICK_MS: u64 = 50;
+const AUTO_CLOSE_TICKS: u8 = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PhaseKind {
@@ -33,54 +27,18 @@ enum PhaseKind {
     Failed,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum StepVisual {
-    Completed,
-    Active,
-    Pending,
-    Restoring,
-    Failed,
-}
-
 #[derive(Debug)]
 struct UiState {
     event: UpdateEvent,
-    active_step: usize,
 }
 
 impl UiState {
     fn new(event: UpdateEvent) -> Self {
-        let mut state = Self {
-            event,
-            active_step: 0,
-        };
-        state.sync_step_from_stage();
-        state
+        Self { event }
     }
 
     fn apply_event(&mut self, event: UpdateEvent) {
         self.event = event;
-        self.sync_step_from_stage();
-    }
-
-    fn sync_step_from_stage(&mut self) {
-        match self.event.stage.as_str() {
-            "Preparando actualización" | "Respaldo no disponible" | "Verificando integridad" => {
-                self.active_step = 0;
-            }
-            "Esperando cierre de la aplicación" => self.active_step = 1,
-            "Instalando actualización" => self.active_step = 2,
-            "Validando instalación" => self.active_step = 3,
-            "Reiniciando aplicación" => self.active_step = 4,
-            "Actualización completada" => self.active_step = STEPS.len(),
-            _ => {
-                if self.event.terminal && self.event.success {
-                    self.active_step = STEPS.len();
-                } else {
-                    self.active_step = self.active_step.min(STEPS.len() - 1);
-                }
-            }
-        }
     }
 
     fn phase_kind(&self) -> PhaseKind {
@@ -101,11 +59,59 @@ impl UiState {
 
     fn headline(&self) -> &'static str {
         match self.phase_kind() {
-            PhaseKind::Running => "Aplicando actualización…",
-            PhaseKind::Restoring => "Restaurando versión anterior…",
+            PhaseKind::Running => "Aplicando actualización...",
+            PhaseKind::Restoring => "Restaurando versión anterior...",
             PhaseKind::Succeeded => "Actualización completada",
             PhaseKind::RestoredAfterFailure => "Se restauró la versión anterior",
-            PhaseKind::Failed => "No se pudo completar la actualización",
+            PhaseKind::Failed => "No se pudo actualizar",
+        }
+    }
+
+    fn subtitle(&self) -> String {
+        match self.phase_kind() {
+            PhaseKind::Running => "Espera un momento mientras se instala la actualización.".into(),
+            PhaseKind::Restoring => {
+                "Se detectó un problema y se está restaurando la versión anterior.".into()
+            }
+            PhaseKind::Succeeded => "La nueva versión ya está lista.".into(),
+            PhaseKind::RestoredAfterFailure | PhaseKind::Failed => self.event.message.clone(),
+        }
+    }
+
+    fn status_line(&self) -> String {
+        match self.phase_kind() {
+            PhaseKind::Succeeded => "Cerrando actualizador...".into(),
+            PhaseKind::RestoredAfterFailure => "Versión anterior restaurada.".into(),
+            PhaseKind::Failed => "Actualización fallida.".into(),
+            PhaseKind::Restoring => "Restaurando respaldo firmado...".into(),
+            PhaseKind::Running => match self.event.stage.as_str() {
+                "Preparando actualización" | "Respaldo no disponible" => {
+                    "Preparando actualización...".into()
+                }
+                "Verificando integridad" => {
+                    if let Some(fraction) = self.progress_fraction() {
+                        let percent = (fraction * 100.0).round() as u8;
+                        format!("Copiando instalador... {percent} %")
+                    } else if self.event.message.contains("SHA-256") {
+                        "Comprobando integridad SHA-256...".into()
+                    } else {
+                        "Verificando integridad...".into()
+                    }
+                }
+                "Esperando cierre de la aplicación" => {
+                    "Esperando cierre de la aplicación...".into()
+                }
+                "Instalando actualización" => "Instalando actualización...".into(),
+                "Validando instalación" => "Validando instalación...".into(),
+                "Reiniciando aplicación" => {
+                    if self.event.message.contains("confirmación") {
+                        "Esperando confirmación de arranque...".into()
+                    } else {
+                        "Reiniciando aplicación...".into()
+                    }
+                }
+                other => format!("{other}..."),
+            },
         }
     }
 
@@ -119,72 +125,25 @@ impl UiState {
         }
         Some((done as f32 / total as f32).clamp(0.0, 1.0))
     }
+}
 
-    fn step_visual(&self, index: usize) -> StepVisual {
-        match self.phase_kind() {
-            PhaseKind::Succeeded => StepVisual::Completed,
-            PhaseKind::Running => {
-                if index < self.active_step {
-                    StepVisual::Completed
-                } else if index == self.active_step {
-                    StepVisual::Active
-                } else {
-                    StepVisual::Pending
-                }
-            }
-            PhaseKind::Restoring | PhaseKind::RestoredAfterFailure => {
-                if index < self.active_step {
-                    StepVisual::Completed
-                } else if index == self.active_step {
-                    StepVisual::Restoring
-                } else {
-                    StepVisual::Pending
-                }
-            }
-            PhaseKind::Failed => {
-                if index < self.active_step {
-                    StepVisual::Completed
-                } else if index == self.active_step {
-                    StepVisual::Failed
-                } else {
-                    StepVisual::Pending
-                }
-            }
-        }
-    }
+fn should_auto_close(finished: bool, succeeded: bool, finish_ticks: u8) -> bool {
+    finished && succeeded && finish_ticks >= AUTO_CLOSE_TICKS
 }
 
 #[derive(Clone, Copy)]
 struct Palette {
-    bg_start: Hsla,
-    bg_end: Hsla,
-    glow_bg: Hsla,
-    glow_border: Hsla,
+    bg: Hsla,
     titlebar_bg: Hsla,
     titlebar_border: Hsla,
-    divider: Hsla,
     text_primary: Hsla,
     text_secondary: Hsla,
-    text_muted: Hsla,
     version_pill_bg: Hsla,
-    version_pill_border: Hsla,
-    version_from: Hsla,
-    version_to_bg: Hsla,
-    version_to_text: Hsla,
+    version_pill_text: Hsla,
     track_bg: Hsla,
     bar_start: Hsla,
     bar_end: Hsla,
-    percent_pill_bg: Hsla,
-    percent_pill_border: Hsla,
-    percent_pill_text: Hsla,
-    step_done_bg: Hsla,
-    step_done_fg: Hsla,
-    step_active_ring: Hsla,
-    step_active_core: Hsla,
-    step_active_halo: Hsla,
-    step_pending_border: Hsla,
-    step_line_done: Hsla,
-    step_line_pending: Hsla,
+    spinner_track: Hsla,
     control_fg: Hsla,
     control_disabled: Hsla,
     control_hover: Hsla,
@@ -211,35 +170,17 @@ impl Palette {
 
     fn dark() -> Self {
         Self {
-            bg_start: rgb(0x0b1220).into(),
-            bg_end: rgb(0x0e172a).into(),
-            glow_bg: rgba(0x1d4ed826).into(),
-            glow_border: rgba(0x3b82f63d).into(),
-            titlebar_bg: rgba(0x111a2de6).into(),
+            bg: rgb(0x131a26).into(),
+            titlebar_bg: rgb(0x182130).into(),
             titlebar_border: rgba(0xffffff14).into(),
-            divider: rgba(0xffffff1f).into(),
             text_primary: rgb(0xf8fafc).into(),
-            text_secondary: rgb(0x94a3b8).into(),
-            text_muted: rgb(0x64748b).into(),
-            version_pill_bg: rgba(0x1e293bc7).into(),
-            version_pill_border: rgba(0x94a3b824).into(),
-            version_from: rgb(0xcbd5e1).into(),
-            version_to_bg: rgba(0x2563eb29).into(),
-            version_to_text: rgb(0x38bdf8).into(),
-            track_bg: rgb(0x1f2b3e).into(),
+            text_secondary: rgb(0xa3b2c7).into(),
+            version_pill_bg: rgb(0x243044).into(),
+            version_pill_text: rgb(0xcbd5e1).into(),
+            track_bg: rgb(0x253247).into(),
             bar_start: rgb(0x1d68ff).into(),
             bar_end: rgb(0x00d2ff).into(),
-            percent_pill_bg: rgba(0x16243bf0).into(),
-            percent_pill_border: rgba(0x38bdf833).into(),
-            percent_pill_text: rgb(0x38bdf8).into(),
-            step_done_bg: rgb(0x16a34a).into(),
-            step_done_fg: rgb(0xffffff).into(),
-            step_active_ring: rgb(0x3b82f6).into(),
-            step_active_core: rgb(0x2563eb).into(),
-            step_active_halo: rgba(0x2563eb33).into(),
-            step_pending_border: rgb(0x475569).into(),
-            step_line_done: rgb(0x334155).into(),
-            step_line_pending: rgb(0x243044).into(),
+            spinner_track: rgba(0x94a3b833).into(),
             control_fg: rgb(0xcbd5e1).into(),
             control_disabled: rgba(0x94a3b840).into(),
             control_hover: rgba(0xffffff14).into(),
@@ -251,43 +192,25 @@ impl Palette {
             restore_end: rgb(0xfbbf24).into(),
             error_start: rgb(0xdc2626).into(),
             error_end: rgb(0xf87171).into(),
-            button_bg: rgba(0x1e293bf0).into(),
-            button_hover: rgba(0x334155f0).into(),
+            button_bg: rgb(0x243044).into(),
+            button_hover: rgb(0x31415c).into(),
             button_border: rgba(0xffffff1a).into(),
         }
     }
 
     fn light() -> Self {
         Self {
-            bg_start: rgb(0xf9fbff).into(),
-            bg_end: rgb(0xf1f6ff).into(),
-            glow_bg: rgba(0x93c5fd38).into(),
-            glow_border: rgba(0x93c5fd4d).into(),
-            titlebar_bg: rgba(0xf5f8ffeb).into(),
+            bg: rgb(0xf7f9fc).into(),
+            titlebar_bg: rgb(0xf4f7fc).into(),
             titlebar_border: rgba(0x0f172a12).into(),
-            divider: rgba(0x0f172a1a).into(),
             text_primary: rgb(0x0f172a).into(),
-            text_secondary: rgb(0x475569).into(),
-            text_muted: rgb(0x64748b).into(),
-            version_pill_bg: rgb(0xedf2fc).into(),
-            version_pill_border: rgba(0x2563eb1a).into(),
-            version_from: rgb(0x334155).into(),
-            version_to_bg: rgba(0x2563eb1c).into(),
-            version_to_text: rgb(0x1d4ed8).into(),
-            track_bg: rgb(0xe2e8f0).into(),
+            text_secondary: rgb(0x4b5563).into(),
+            version_pill_bg: rgb(0xe7eef9).into(),
+            version_pill_text: rgb(0x1e293b).into(),
+            track_bg: rgb(0xdce4f2).into(),
             bar_start: rgb(0x1d68ff).into(),
             bar_end: rgb(0x00c8ff).into(),
-            percent_pill_bg: rgb(0xe8f0fe).into(),
-            percent_pill_border: rgba(0x2563eb1f).into(),
-            percent_pill_text: rgb(0x1d4ed8).into(),
-            step_done_bg: rgb(0x16a34a).into(),
-            step_done_fg: rgb(0xffffff).into(),
-            step_active_ring: rgb(0x1d4ed8).into(),
-            step_active_core: rgb(0x1d4ed8).into(),
-            step_active_halo: rgba(0x2563eb26).into(),
-            step_pending_border: rgb(0xcbd5e1).into(),
-            step_line_done: rgb(0xb8c7dc).into(),
-            step_line_pending: rgb(0xdbe4f0).into(),
+            spinner_track: rgba(0x64748b33).into(),
             control_fg: rgb(0x1e293b).into(),
             control_disabled: rgba(0x64748b47).into(),
             control_hover: rgba(0x0f172a0f).into(),
@@ -299,8 +222,8 @@ impl Palette {
             restore_end: rgb(0xf59e0b).into(),
             error_start: rgb(0xdc2626).into(),
             error_end: rgb(0xef4444).into(),
-            button_bg: rgb(0xeff4fc).into(),
-            button_hover: rgb(0xe2ebfa).into(),
+            button_bg: rgb(0xe7eef9).into(),
+            button_hover: rgb(0xdbe6f7).into(),
             button_border: rgba(0x0f172a14).into(),
         }
     }
@@ -313,15 +236,9 @@ fn indeterminate_offset(tick: usize, bar_width: f32) -> f32 {
     wave * (1.0 - bar_width)
 }
 
-#[derive(Clone)]
-enum VersionBadge {
-    Transition { from: String, to: String },
-    Note(String),
-}
-
 struct View {
     name: String,
-    versions: VersionBadge,
+    version_pill: String,
     icon: Option<PathBuf>,
     state: Arc<Mutex<UiState>>,
     can_close: Arc<AtomicBool>,
@@ -329,10 +246,10 @@ struct View {
 }
 
 impl View {
-    fn render_app_icon(&self) -> impl IntoElement {
+    fn render_app_icon(&self, dimension: f32, radius: f32, glyph_size: f32) -> impl IntoElement {
         let base = div()
-            .size(px(26.))
-            .rounded(px(7.))
+            .size(px(dimension))
+            .rounded(px(radius))
             .overflow_hidden()
             .flex()
             .items_center()
@@ -340,7 +257,7 @@ impl View {
             .flex_shrink_0();
 
         match &self.icon {
-            Some(path) => base.child(img(path.clone()).size(px(26.))),
+            Some(path) => base.child(img(path.clone()).size(px(dimension))),
             None => base
                 .bg(linear_gradient(
                     135.,
@@ -348,48 +265,9 @@ impl View {
                     linear_color_stop(rgb(0x00b4ff), 1.),
                 ))
                 .text_color(rgb(0xffffff))
-                .text_size(px(14.))
+                .text_size(px(glyph_size))
                 .font_weight(FontWeight::BOLD)
                 .child("↑"),
-        }
-    }
-
-    fn render_version_pill(&self, palette: Palette) -> impl IntoElement {
-        let pill = div()
-            .flex()
-            .items_center()
-            .gap(px(6.))
-            .px(px(10.))
-            .py(px(3.))
-            .rounded_full()
-            .bg(palette.version_pill_bg)
-            .border_1()
-            .border_color(palette.version_pill_border)
-            .text_size(px(12.));
-
-        match &self.versions {
-            VersionBadge::Transition { from, to } => pill
-                .child(
-                    div()
-                        .text_color(palette.version_from)
-                        .font_weight(FontWeight::MEDIUM)
-                        .child(from.clone()),
-                )
-                .child(div().text_color(palette.text_muted).child("→"))
-                .child(
-                    div()
-                        .px(px(6.))
-                        .py(px(1.))
-                        .rounded_full()
-                        .bg(palette.version_to_bg)
-                        .text_color(palette.version_to_text)
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .child(to.clone()),
-                ),
-            VersionBadge::Note(note) => pill
-                .text_color(palette.text_secondary)
-                .font_weight(FontWeight::MEDIUM)
-                .child(note.clone()),
         }
     }
 
@@ -398,7 +276,7 @@ impl View {
 
         let close_btn = div()
             .id("window-close")
-            .w(px(40.))
+            .w(px(38.))
             .h_full()
             .flex()
             .items_center()
@@ -422,7 +300,7 @@ impl View {
 
         div()
             .w_full()
-            .h(px(46.))
+            .h(px(44.))
             .bg(palette.titlebar_bg)
             .border_b_1()
             .border_color(palette.titlebar_border)
@@ -434,23 +312,33 @@ impl View {
                 div()
                     .flex_1()
                     .h_full()
-                    .pl(px(16.))
-                    .pr(px(12.))
+                    .pl(px(14.))
+                    .pr(px(10.))
                     .flex()
                     .items_center()
                     .gap(px(10.))
                     .window_control_area(WindowControlArea::Drag)
-                    .child(self.render_app_icon())
+                    .child(self.render_app_icon(22., 6., 12.))
                     .child(
                         div()
-                            .text_size(px(14.))
+                            .text_size(px(13.5))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(palette.text_primary)
                             .whitespace_nowrap()
                             .child(self.name.clone()),
                     )
-                    .child(div().w(px(1.)).h(px(16.)).bg(palette.divider))
-                    .child(self.render_version_pill(palette)),
+                    .child(
+                        div()
+                            .px(px(10.))
+                            .py(px(3.))
+                            .rounded_full()
+                            .bg(palette.version_pill_bg)
+                            .text_size(px(11.5))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(palette.version_pill_text)
+                            .whitespace_nowrap()
+                            .child(self.version_pill.clone()),
+                    ),
             )
             .child(
                 div()
@@ -461,7 +349,7 @@ impl View {
                     .child(
                         div()
                             .id("window-minimize")
-                            .w(px(40.))
+                            .w(px(38.))
                             .h_full()
                             .flex()
                             .items_center()
@@ -496,15 +384,15 @@ impl View {
             (PhaseKind::Succeeded | PhaseKind::RestoredAfterFailure | PhaseKind::Failed, _) => {
                 (0.0_f32, 1.0_f32)
             }
-            (_, Some(f)) => (0.0_f32, f.max(0.03)),
+            (_, Some(f)) => (0.0_f32, f.max(0.04)),
             (_, None) => (
                 indeterminate_offset(self.tick, INDETERMINATE_WIDTH),
                 INDETERMINATE_WIDTH,
             ),
         };
 
-        let bar = div()
-            .flex_1()
+        div()
+            .w_full()
             .h(px(10.))
             .bg(palette.track_bg)
             .rounded_full()
@@ -520,160 +408,111 @@ impl View {
                         linear_color_stop(start, 0.),
                         linear_color_stop(end, 1.),
                     )),
-            );
-
-        div()
-            .w_full()
-            .max_w(px(520.))
-            .flex()
-            .items_center()
-            .gap(px(12.))
-            .child(bar)
-            .when_some(fraction, |row, f| {
-                let percent = (f * 100.0).round() as u8;
-                row.child(
-                    div()
-                        .px(px(12.))
-                        .py(px(4.))
-                        .rounded_full()
-                        .bg(palette.percent_pill_bg)
-                        .border_1()
-                        .border_color(palette.percent_pill_border)
-                        .text_size(px(13.))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(palette.percent_pill_text)
-                        .whitespace_nowrap()
-                        .flex_shrink_0()
-                        .child(format!("{percent} %")),
-                )
-            })
+            )
     }
 
-    fn render_stepper(&self, state: &UiState, palette: Palette) -> impl IntoElement {
-        div()
-            .w_full()
-            .max_w(px(560.))
-            .mt(px(4.))
-            .flex()
-            .items_start()
-            .children(STEPS.iter().enumerate().map(|(index, label)| {
-                let visual = state.step_visual(index);
-                let left_done = index > 0 && state.step_visual(index - 1) == StepVisual::Completed;
-                let right_done = index + 1 < STEPS.len() && visual == StepVisual::Completed;
+    fn render_spinner(&self, phase: PhaseKind, palette: Palette) -> impl IntoElement {
+        let tick = self.tick;
+        let (arc_start, arc_end) = match phase {
+            PhaseKind::Restoring => (palette.restore_start, palette.restore_end),
+            _ => (palette.bar_start, palette.bar_end),
+        };
+        let track_color = palette.spinner_track;
 
-                let left_line = div().flex_1().h(px(1.5)).when(index > 0, |line| {
-                    line.bg(if left_done {
-                        palette.step_line_done
-                    } else {
-                        palette.step_line_pending
-                    })
-                });
+        canvas(
+            |_, _, _| (),
+            move |bounds, (), window, _| {
+                let cx = f32::from(bounds.origin.x) + f32::from(bounds.size.width) * 0.5;
+                let cy = f32::from(bounds.origin.y) + f32::from(bounds.size.height) * 0.5;
+                let radius =
+                    (f32::from(bounds.size.width).min(f32::from(bounds.size.height)) * 0.5 - 2.0)
+                        .max(2.0);
+                let radii = point(px(radius), px(radius));
 
-                let right_line = div()
-                    .flex_1()
-                    .h(px(1.5))
-                    .when(index + 1 < STEPS.len(), |line| {
-                        line.bg(if right_done {
-                            palette.step_line_done
-                        } else {
-                            palette.step_line_pending
-                        })
-                    });
+                let mut track = PathBuilder::stroke(px(2.2));
+                track.move_to(point(px(cx + radius), px(cy)));
+                track.arc_to(radii, px(0.), false, true, point(px(cx - radius), px(cy)));
+                track.arc_to(radii, px(0.), false, true, point(px(cx + radius), px(cy)));
+                if let Ok(path) = track.build() {
+                    window.paint_path(path, track_color);
+                }
 
-                let node = match visual {
-                    StepVisual::Completed => div()
-                        .size(px(24.))
-                        .rounded_full()
-                        .bg(palette.step_done_bg)
-                        .text_color(palette.step_done_fg)
-                        .text_size(px(12.))
-                        .font_weight(FontWeight::BOLD)
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .flex_shrink_0()
-                        .child("✓"),
-                    StepVisual::Active => div()
-                        .size(px(24.))
-                        .rounded_full()
-                        .bg(palette.step_active_halo)
-                        .border_2()
-                        .border_color(palette.step_active_ring)
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .flex_shrink_0()
-                        .child(
-                            div()
-                                .size(px(10.))
-                                .rounded_full()
-                                .bg(palette.step_active_core),
+                let start_angle = (tick as f32) * 0.24;
+                let sweep_angle = 2.45_f32;
+                let end_angle = start_angle + sweep_angle;
+                let p0 = point(
+                    px(cx + radius * start_angle.cos()),
+                    px(cy + radius * start_angle.sin()),
+                );
+                let p1 = point(
+                    px(cx + radius * end_angle.cos()),
+                    px(cy + radius * end_angle.sin()),
+                );
+
+                let mut arc = PathBuilder::stroke(px(2.4));
+                arc.move_to(p0);
+                arc.arc_to(radii, px(0.), false, true, p1);
+                if let Ok(path) = arc.build() {
+                    window.paint_path(
+                        path,
+                        linear_gradient(
+                            135.,
+                            linear_color_stop(arc_start, 0.),
+                            linear_color_stop(arc_end, 1.),
                         ),
-                    StepVisual::Restoring => div()
-                        .size(px(24.))
-                        .rounded_full()
-                        .bg(palette.restore_start)
-                        .text_color(rgb(0xffffff))
-                        .text_size(px(12.))
-                        .font_weight(FontWeight::BOLD)
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .flex_shrink_0()
-                        .child("↺"),
-                    StepVisual::Failed => div()
-                        .size(px(24.))
-                        .rounded_full()
-                        .bg(palette.error_start)
-                        .text_color(rgb(0xffffff))
-                        .text_size(px(12.))
-                        .font_weight(FontWeight::BOLD)
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .flex_shrink_0()
-                        .child("✕"),
-                    StepVisual::Pending => div()
-                        .size(px(24.))
-                        .rounded_full()
-                        .border_2()
-                        .border_color(palette.step_pending_border)
-                        .flex_shrink_0(),
-                };
+                    );
+                }
+            },
+        )
+        .size(px(18.))
+        .flex_shrink_0()
+    }
 
-                let (label_color, label_weight) = match visual {
-                    StepVisual::Active | StepVisual::Restoring | StepVisual::Failed => {
-                        (palette.text_primary, FontWeight::SEMIBOLD)
-                    }
-                    StepVisual::Completed => (palette.text_secondary, FontWeight::MEDIUM),
-                    StepVisual::Pending => (palette.text_muted, FontWeight::NORMAL),
-                };
-
-                div()
-                    .flex_1()
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .gap(px(8.))
-                    .child(
-                        div()
-                            .w_full()
-                            .flex()
-                            .items_center()
-                            .child(left_line)
-                            .child(node)
-                            .child(right_line),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(12.))
-                            .font_weight(label_weight)
-                            .text_color(label_color)
-                            .text_center()
-                            .whitespace_nowrap()
-                            .child(*label),
-                    )
-            }))
+    fn render_status_indicator(&self, phase: PhaseKind, palette: Palette) -> impl IntoElement {
+        match phase {
+            PhaseKind::Running | PhaseKind::Restoring => {
+                self.render_spinner(phase, palette).into_any_element()
+            }
+            PhaseKind::Succeeded => div()
+                .size(px(18.))
+                .rounded_full()
+                .bg(palette.success_start)
+                .text_color(rgb(0xffffff))
+                .text_size(px(11.))
+                .font_weight(FontWeight::BOLD)
+                .flex()
+                .items_center()
+                .justify_center()
+                .flex_shrink_0()
+                .child("✓")
+                .into_any_element(),
+            PhaseKind::RestoredAfterFailure => div()
+                .size(px(18.))
+                .rounded_full()
+                .bg(palette.restore_start)
+                .text_color(rgb(0xffffff))
+                .text_size(px(11.))
+                .font_weight(FontWeight::BOLD)
+                .flex()
+                .items_center()
+                .justify_center()
+                .flex_shrink_0()
+                .child("↺")
+                .into_any_element(),
+            PhaseKind::Failed => div()
+                .size(px(18.))
+                .rounded_full()
+                .bg(palette.error_start)
+                .text_color(rgb(0xffffff))
+                .text_size(px(11.))
+                .font_weight(FontWeight::BOLD)
+                .flex()
+                .items_center()
+                .justify_center()
+                .flex_shrink_0()
+                .child("✕")
+                .into_any_element(),
+        }
     }
 }
 
@@ -692,105 +531,107 @@ impl Render for View {
         };
 
         div()
-            .relative()
             .size_full()
             .overflow_hidden()
-            .bg(linear_gradient(
-                145.,
-                linear_color_stop(palette.bg_start, 0.),
-                linear_color_stop(palette.bg_end, 1.),
-            ))
+            .bg(palette.bg)
             .text_color(palette.text_primary)
             .flex()
             .flex_col()
-            // Subtle decorative ambient glows matching the reference design
-            .child(
-                div()
-                    .absolute()
-                    .top(px(-110.))
-                    .right(px(-95.))
-                    .size(px(260.))
-                    .rounded_full()
-                    .bg(palette.glow_bg)
-                    .border_1()
-                    .border_color(palette.glow_border),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .bottom(px(-140.))
-                    .left(px(-100.))
-                    .size(px(270.))
-                    .rounded_full()
-                    .bg(palette.glow_bg)
-                    .border_1()
-                    .border_color(palette.glow_border),
-            )
             .child(self.render_titlebar(palette, closable))
             .child(
                 div()
                     .flex_1()
                     .w_full()
-                    .px(px(36.))
-                    .py(px(24.))
+                    .px(px(24.))
+                    .py(px(20.))
                     .flex()
                     .flex_col()
-                    .items_center()
-                    .justify_center()
-                    .gap(px(22.))
+                    .justify_between()
+                    .gap(px(16.))
                     .child(
                         div()
+                            .w_full()
                             .flex()
-                            .flex_col()
                             .items_center()
-                            .gap(px(8.))
+                            .gap(px(16.))
+                            .child(self.render_app_icon(56., 14., 26.))
                             .child(
                                 div()
-                                    .text_size(px(26.))
-                                    .font_weight(FontWeight::BOLD)
-                                    .text_color(title_color)
-                                    .text_center()
-                                    .child(state.headline()),
-                            )
-                            .child(
-                                div()
-                                    .max_w(px(500.))
-                                    .text_size(px(13.5))
-                                    .text_color(palette.text_secondary)
-                                    .text_center()
-                                    .child(state.event.message.clone()),
+                                    .flex_1()
+                                    .min_w_0()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(4.))
+                                    .child(
+                                        div()
+                                            .text_size(px(20.))
+                                            .font_weight(FontWeight::BOLD)
+                                            .text_color(title_color)
+                                            .child(state.headline()),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(13.))
+                                            .text_color(palette.text_secondary)
+                                            .child(state.subtitle()),
+                                    ),
                             ),
                     )
                     .child(self.render_progress(&state, palette))
-                    .child(self.render_stepper(&state, palette))
-                    .when(state.event.terminal && closable, |content| {
-                        content.child(
-                            div()
-                                .id("close-terminal-button")
-                                .mt(px(4.))
-                                .px(px(20.))
-                                .py(px(7.))
-                                .rounded_full()
-                                .bg(palette.button_bg)
-                                .border_1()
-                                .border_color(palette.button_border)
-                                .text_size(px(13.))
-                                .font_weight(FontWeight::MEDIUM)
-                                .text_color(palette.text_primary)
-                                .cursor_pointer()
-                                .hover(move |s| s.bg(palette.button_hover))
-                                .on_mouse_down(MouseButton::Left, |_, window, _| {
-                                    window.remove_window();
-                                })
-                                .child("Cerrar"),
-                        )
-                    }),
+                    .child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap(px(10.))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(10.))
+                                    .child(self.render_status_indicator(phase, palette))
+                                    .child(
+                                        div()
+                                            .text_size(px(13.))
+                                            .text_color(palette.text_secondary)
+                                            .child(state.status_line()),
+                                    ),
+                            )
+                            .when(
+                                state.event.terminal && !state.event.success && closable,
+                                |footer| {
+                                    footer.child(
+                                        div()
+                                            .id("close-terminal-button")
+                                            .px(px(14.))
+                                            .py(px(5.))
+                                            .rounded_full()
+                                            .bg(palette.button_bg)
+                                            .border_1()
+                                            .border_color(palette.button_border)
+                                            .text_size(px(12.))
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(palette.text_primary)
+                                            .cursor_pointer()
+                                            .flex_shrink_0()
+                                            .hover(move |s| s.bg(palette.button_hover))
+                                            .on_mouse_down(MouseButton::Left, |_, window, _| {
+                                                window.remove_window();
+                                            })
+                                            .child("Cerrar"),
+                                    )
+                                },
+                            ),
+                    ),
             )
     }
 }
 
 fn window_options(title: &str, cx: &mut App) -> WindowOptions {
-    let bounds = Bounds::centered(None, size(px(680.), px(390.)), cx);
+    let bounds = Bounds::centered(None, size(px(470.), px(248.)), cx);
     WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
         titlebar: Some(TitlebarOptions {
@@ -807,6 +648,7 @@ fn window_options(title: &str, cx: &mut App) -> WindowOptions {
 pub fn run(job: Job) -> anyhow::Result<bool> {
     let result = Arc::new(AtomicBool::new(false));
     let worker_result = result.clone();
+    let auto_close_result = result.clone();
     let failure = Arc::new(Mutex::new(None));
     let window_failure = failure.clone();
     gpui_kit::application().run(move |cx: &mut App| {
@@ -823,10 +665,7 @@ pub fn run(job: Job) -> anyhow::Result<bool> {
         let view_name = job.name.clone();
         let view = View {
             name: job.name.clone(),
-            versions: VersionBadge::Transition {
-                from: format!("v{}", job.current),
-                to: format!("v{}", job.target),
-            },
+            version_pill: format!("v{} → v{}", job.current, job.target),
             icon: job.icon.clone(),
             state: state.clone(),
             can_close: finished.clone(),
@@ -838,23 +677,6 @@ pub fn run(job: Job) -> anyhow::Result<bool> {
             cx.new(|cx| {
                 cx.observe_window_appearance(window, |_, _, cx| cx.notify())
                     .detach();
-                cx.spawn(async move |entity, cx| {
-                    loop {
-                        cx.background_executor()
-                            .timer(Duration::from_millis(60))
-                            .await;
-                        if entity
-                            .update(cx, |view: &mut View, cx| {
-                                view.tick = view.tick.wrapping_add(1);
-                                cx.notify();
-                            })
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                })
-                .detach();
                 view
             })
         });
@@ -863,24 +685,49 @@ pub fn run(job: Job) -> anyhow::Result<bool> {
             cx.quit();
             return;
         };
+        let worker_finished = finished.clone();
         let worker = std::thread::spawn(move || {
-            worker_result.store(
-                job.run(|status| {
-                    state.lock().expect("state mutex").apply_event(UpdateEvent {
-                        stage: status.stage.clone(),
-                        message: status.message.clone(),
-                        terminal: status.terminal,
-                        success: status.success,
-                        progress: status.progress,
-                    });
-                }),
-                Ordering::Release,
-            );
-            finished.store(true, Ordering::Release);
+            let ok = job.run(|status| {
+                state.lock().expect("state mutex").apply_event(UpdateEvent {
+                    stage: status.stage.clone(),
+                    message: status.message.clone(),
+                    terminal: status.terminal,
+                    success: status.success,
+                    progress: status.progress,
+                });
+            });
+            worker_result.store(ok, Ordering::Release);
+            worker_finished.store(true, Ordering::Release);
         });
         let _ = window.update(cx, |_, window, cx| {
             window.on_window_should_close(cx, move |_, _| can_close.load(Ordering::Acquire));
         });
+        let auto_close_finished = finished.clone();
+        cx.spawn(async move |cx| {
+            let mut finish_ticks: u8 = 0;
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(TICK_MS))
+                    .await;
+                let is_finished = auto_close_finished.load(Ordering::Acquire);
+                let is_success = auto_close_result.load(Ordering::Acquire);
+                if is_finished && is_success {
+                    finish_ticks = finish_ticks.saturating_add(1);
+                }
+                let close_now = should_auto_close(is_finished, is_success, finish_ticks);
+                let updated = window.update(cx, |view, window, cx| {
+                    view.tick = view.tick.wrapping_add(1);
+                    cx.notify();
+                    if close_now {
+                        window.remove_window();
+                    }
+                });
+                if updated.is_err() || close_now || (is_finished && !is_success) {
+                    break;
+                }
+            }
+        })
+        .detach();
         cx.on_window_closed(|cx, _| {
             if cx.windows().is_empty() {
                 cx.quit();
@@ -916,7 +763,7 @@ pub fn show_preparation_error(message: String) {
                     .detach();
                 View {
                     name: "Veltrix".into(),
-                    versions: VersionBadge::Note("No se pudo preparar la actualización".into()),
+                    version_pill: "Error de preparación".into(),
                     icon: None,
                     state,
                     can_close,
@@ -953,21 +800,28 @@ mod tests {
     }
 
     #[test]
-    fn maps_all_veltrix_stages_to_five_steps() {
+    fn formats_status_lines_for_veltrix_stages() {
         let mut state = UiState::new(event("Preparando actualización", "Inicio", false, false));
-        assert_eq!(state.active_step, 0);
         assert_eq!(state.phase_kind(), PhaseKind::Running);
-        assert_eq!(state.headline(), "Aplicando actualización…");
-        assert_eq!(state.step_visual(0), StepVisual::Active);
-        assert_eq!(state.step_visual(1), StepVisual::Pending);
+        assert_eq!(state.headline(), "Aplicando actualización...");
+        assert_eq!(state.status_line(), "Preparando actualización...");
+
+        state.apply_event(UpdateEvent {
+            stage: "Verificando integridad".into(),
+            message: "Copiando el instalador.".into(),
+            terminal: false,
+            success: false,
+            progress: Some((45, 100)),
+        });
+        assert_eq!(state.status_line(), "Copiando instalador... 45 %");
 
         state.apply_event(event(
             "Verificando integridad",
-            "Copiando el instalador.",
+            "Comprobando SHA-256.",
             false,
             false,
         ));
-        assert_eq!(state.active_step, 0);
+        assert_eq!(state.status_line(), "Comprobando integridad SHA-256...");
 
         state.apply_event(event(
             "Esperando cierre de la aplicación",
@@ -975,9 +829,7 @@ mod tests {
             false,
             false,
         ));
-        assert_eq!(state.active_step, 1);
-        assert_eq!(state.step_visual(0), StepVisual::Completed);
-        assert_eq!(state.step_visual(1), StepVisual::Active);
+        assert_eq!(state.status_line(), "Esperando cierre de la aplicación...");
 
         state.apply_event(event(
             "Instalando actualización",
@@ -985,49 +837,35 @@ mod tests {
             false,
             false,
         ));
-        assert_eq!(state.active_step, 2);
-        assert_eq!(state.step_visual(1), StepVisual::Completed);
-        assert_eq!(state.step_visual(2), StepVisual::Active);
+        assert_eq!(state.status_line(), "Instalando actualización...");
 
         state.apply_event(event("Validando instalación", "Validando.", false, false));
-        assert_eq!(state.active_step, 3);
-        assert_eq!(state.step_visual(2), StepVisual::Completed);
-        assert_eq!(state.step_visual(3), StepVisual::Active);
+        assert_eq!(state.status_line(), "Validando instalación...");
 
         state.apply_event(event(
             "Reiniciando aplicación",
-            "Reiniciando.",
+            "Esperando la confirmación de arranque.",
             false,
             false,
         ));
-        assert_eq!(state.active_step, 4);
-        assert_eq!(state.step_visual(3), StepVisual::Completed);
-        assert_eq!(state.step_visual(4), StepVisual::Active);
+        assert_eq!(state.status_line(), "Esperando confirmación de arranque...");
 
         state.apply_event(event("Actualización completada", "Listo.", true, true));
         assert_eq!(state.phase_kind(), PhaseKind::Succeeded);
-        for idx in 0..STEPS.len() {
-            assert_eq!(state.step_visual(idx), StepVisual::Completed);
-        }
+        assert_eq!(state.status_line(), "Cerrando actualizador...");
     }
 
     #[test]
-    fn preserves_failed_step_during_restoration_and_terminal_failure() {
-        let mut state = UiState::new(event("Instalando actualización", "NSIS", false, false));
-        assert_eq!(state.active_step, 2);
-
-        state.apply_event(event(
+    fn distinguishes_restoring_restored_and_failed_states() {
+        let mut state = UiState::new(event(
             "Restaurando instalación",
             "Aplicando respaldo.",
             false,
             false,
         ));
-        assert_eq!(state.active_step, 2);
         assert_eq!(state.phase_kind(), PhaseKind::Restoring);
-        assert_eq!(state.step_visual(0), StepVisual::Completed);
-        assert_eq!(state.step_visual(1), StepVisual::Completed);
-        assert_eq!(state.step_visual(2), StepVisual::Restoring);
-        assert_eq!(state.step_visual(3), StepVisual::Pending);
+        assert_eq!(state.headline(), "Restaurando versión anterior...");
+        assert_eq!(state.status_line(), "Restaurando respaldo firmado...");
 
         state.apply_event(event(
             "Actualización fallida",
@@ -1036,11 +874,22 @@ mod tests {
             false,
         ));
         assert_eq!(state.phase_kind(), PhaseKind::RestoredAfterFailure);
-        assert_eq!(state.step_visual(2), StepVisual::Restoring);
+        assert_eq!(state.headline(), "Se restauró la versión anterior");
+        assert!(state.subtitle().contains("Se restauró la versión 1.0.0."));
 
         state.apply_event(event("Actualización fallida", "Error fatal.", true, false));
         assert_eq!(state.phase_kind(), PhaseKind::Failed);
-        assert_eq!(state.step_visual(2), StepVisual::Failed);
+        assert_eq!(state.headline(), "No se pudo actualizar");
+        assert_eq!(state.subtitle(), "Error fatal.");
+    }
+
+    #[test]
+    fn auto_closes_only_after_successful_completion() {
+        assert!(!should_auto_close(false, false, AUTO_CLOSE_TICKS));
+        assert!(!should_auto_close(false, true, AUTO_CLOSE_TICKS));
+        assert!(!should_auto_close(true, false, AUTO_CLOSE_TICKS));
+        assert!(!should_auto_close(true, true, AUTO_CLOSE_TICKS - 1));
+        assert!(should_auto_close(true, true, AUTO_CLOSE_TICKS));
     }
 
     #[test]
@@ -1092,8 +941,8 @@ mod tests {
         let light = Palette::for_appearance(WindowAppearance::Light);
         let vibrant_light = Palette::for_appearance(WindowAppearance::VibrantLight);
 
-        assert_eq!(dark.bg_start, vibrant_dark.bg_start);
-        assert_eq!(light.bg_start, vibrant_light.bg_start);
-        assert_ne!(dark.bg_start, light.bg_start);
+        assert_eq!(dark.bg, vibrant_dark.bg);
+        assert_eq!(light.bg, vibrant_light.bg);
+        assert_ne!(dark.bg, light.bg);
     }
 }
