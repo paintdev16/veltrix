@@ -1,4 +1,6 @@
-use crate::windows::Job;
+use crate::platform::Job;
+#[cfg(target_os = "linux")]
+use gpui_kit::WindowDecorations;
 use gpui_kit::{
     App, Bounds, Context, FontWeight, Hsla, MouseButton, PathBuilder, Render, TitlebarOptions,
     Window, WindowAppearance, WindowBounds, WindowControlArea, WindowOptions, canvas, div, img,
@@ -639,6 +641,8 @@ fn window_options(title: &str, cx: &mut App) -> WindowOptions {
             appears_transparent: true,
             traffic_light_position: None,
         }),
+        #[cfg(target_os = "linux")]
+        window_decorations: Some(WindowDecorations::Client),
         is_resizable: false,
         is_minimizable: true,
         ..Default::default()

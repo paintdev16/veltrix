@@ -1,6 +1,6 @@
 //! Minimal GPUI host. Run the network and verification work outside the UI thread.
 //! The trusted policy and paths must be provisioned by the host application.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn main() {
     use gpui_kit::{
         App, Bounds, Context, Render, Window, WindowBounds, WindowOptions, div, prelude::*, px,
@@ -119,7 +119,7 @@ fn main() {
     });
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn previous_status() -> String {
     let result = (|| -> Result<_, Box<dyn std::error::Error>> {
         let exe = std::env::current_exe()?;
@@ -143,7 +143,7 @@ fn previous_status() -> String {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn run_update(progress: impl FnMut(u64, u64)) -> Result<bool, Box<dyn std::error::Error>> {
     #[derive(serde::Deserialize)]
     struct Config {
@@ -189,7 +189,7 @@ fn run_update(progress: impl FnMut(u64, u64)) -> Result<bool, Box<dyn std::error
         current_version: std::fs::read_to_string(root.join("version.txt"))?
             .trim()
             .parse()?,
-        platform: "windows".into(),
+        platform: if cfg!(windows) { "windows" } else { "linux" }.into(),
         architecture: std::env::consts::ARCH.into(),
         public_key,
         max_package_size: config.max_package_size,
@@ -204,25 +204,30 @@ fn run_update(progress: impl FnMut(u64, u64)) -> Result<bool, Box<dyn std::error
         control.join("example-last-job.txt"),
         job.to_string_lossy().as_bytes(),
     )?;
+    let updater_bin = if cfg!(windows) {
+        "veltrix.exe"
+    } else {
+        "veltrix"
+    };
     prepare_update(
         (&policy, &keys),
         &repo.owner,
         &repo.repo,
         &job,
-        &control.join("veltrix.exe"),
+        &control.join(updater_bin),
         &std::sync::atomic::AtomicBool::new(false),
         progress,
     )
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 fn main() {
-    eprintln!("This GPUI integration example currently targets Windows.");
+    eprintln!("This GPUI integration example currently targets Windows and Linux.");
 }
 
 /// Downloads and verifies a release, then starts Veltrix. After `Ok(true)`,
 /// the host must save its work, close helper processes, and exit promptly.
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
 fn prepare_update(
     trust: (&veltrix_core::Policy, &[[u8; 32]]),
     owner: &str,
@@ -245,10 +250,15 @@ fn prepare_update(
     let (manifest, bytes, signature) = release_manifest_with_keys(&client, policy, release, keys)?;
     std::fs::write(job.join("manifest.json"), bytes)?;
     std::fs::write(job.join("manifest.sig"), signature)?;
+    let package_name = if cfg!(windows) {
+        "package.exe"
+    } else {
+        "package.tar.gz"
+    };
     download(
         &client,
         &manifest,
-        &job.join("package.exe"),
+        &job.join(package_name),
         cancel,
         progress,
     )?;

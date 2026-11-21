@@ -605,6 +605,22 @@ mod tests {
         ));
         assert!(child.try_wait().unwrap().is_some());
     }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn readiness_timeout_terminates_stalled_updater() {
+        use std::process::{Command, Stdio};
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "sleep 10"])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        assert!(matches!(
+            wait_for_ready_timeout(&mut child, Duration::from_millis(100)),
+            Err(Error::ReadinessTimeout)
+        ));
+        assert!(child.try_wait().unwrap().is_some());
+    }
 }
 
 /// Versioned handoff sent over the child's standard input. Paths are confined to

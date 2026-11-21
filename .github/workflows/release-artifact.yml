@@ -1,4 +1,4 @@
-name: Release Windows artifact
+name: Release artifacts
 on:
   push:
     tags:
@@ -7,12 +7,12 @@ on:
 permissions:
   contents: write
 jobs:
-  build:
+  build-windows:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Build
+      - name: Build Windows updater
         shell: pwsh
         run: |
           $sdk = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\bin'
@@ -23,29 +23,71 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Copy-Item target/release/veltrix.exe dist/veltrix.exe
-          (Get-FileHash dist/veltrix.exe -Algorithm SHA256).Hash.ToLowerInvariant() + '  veltrix.exe' | Set-Content -Encoding ascii dist/SHA256SUMS.txt
+          (Get-FileHash dist/veltrix.exe -Algorithm SHA256).Hash.ToLowerInvariant() + '  veltrix.exe' | Set-Content -Encoding ascii dist/SHA256SUMS-windows.txt
       - uses: actions/upload-artifact@v4
         with:
           name: veltrix-windows-x86_64-unsigned
           path: dist/
           if-no-files-found: error
+
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux desktop build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libxcb1-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libwayland-dev \
+            libfontconfig1-dev \
+            libfreetype-dev \
+            libvulkan-dev
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build Linux updater
+        run: |
+          cargo build --release --locked -p veltrix
+          mkdir -p dist
+          cp target/release/veltrix dist/veltrix-linux-x86_64
+          chmod 0755 dist/veltrix-linux-x86_64
+          (cd dist && sha256sum veltrix-linux-x86_64 > SHA256SUMS-linux.txt)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: veltrix-linux-x86_64-unsigned
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    needs: [build-windows, build-linux]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: veltrix-windows-x86_64-unsigned
+          path: release-dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: veltrix-linux-x86_64-unsigned
+          path: release-dist
       - name: Publish GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
-        shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          $tag = $env:GITHUB_REF_NAME
-          $isPrerelease = $tag -match '-'
-          $ErrorActionPreference = 'Continue'
-          gh release view $tag *>$null
-          $exists = ($LASTEXITCODE -eq 0)
-          $ErrorActionPreference = 'Stop'
-          if ($exists) {
-            gh release upload $tag dist/veltrix.exe dist/SHA256SUMS.txt --clobber
-          } else {
-            $ghArgs = @('release', 'create', $tag, 'dist/veltrix.exe', 'dist/SHA256SUMS.txt', '--title', $tag, '--generate-notes')
-            if ($isPrerelease) { $ghArgs += '--prerelease' }
-            gh @ghArgs
-          }
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cd release-dist
+          sha256sum veltrix.exe veltrix-linux-x86_64 > SHA256SUMS.txt
+          tag="${GITHUB_REF_NAME}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" veltrix.exe veltrix-linux-x86_64 SHA256SUMS.txt --clobber
+          else
+            args=(release create "$tag" veltrix.exe veltrix-linux-x86_64 SHA256SUMS.txt --title "$tag" --generate-notes)
+            if [[ "$tag" == *-* ]]; then
+              args+=(--prerelease)
+            fi
+            gh "${args[@]}"
+          fi

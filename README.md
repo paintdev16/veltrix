@@ -1,6 +1,6 @@
 # Veltrix
 
-Workspace Rust 2024 para actualizaciones completas de escritorio. La biblioteca puede usarse desde cualquier aplicación Rust. El ejecutable independiente para Windows usa GPUI Kit 0.10 y ejecuta un instalador NSIS autenticado. Compile con Rust estable para Windows y las herramientas de C++ de Visual Studio con Windows SDK.
+Workspace Rust 2024 para actualizaciones completas de escritorio. La biblioteca puede usarse desde cualquier aplicación Rust. El ejecutable independiente usa GPUI Kit 0.10 y soporta **Windows** (instalador NSIS autenticado) y **Linux** (incluido Kali Linux / Debian / Ubuntu, mediante paquetes `.tar.gz` autenticados con extracción atómica). Compile con Rust estable y las herramientas de C++ de Visual Studio con Windows SDK en Windows, o las librerías de desarrollo de X11/Wayland/Vulkan en Linux.
 
 ## Compilar y probar
 
@@ -14,13 +14,37 @@ cargo build --release --locked --bin veltrix
 
 Si GPUI no encuentra el compilador de shaders del SDK, configure `GPUI_FXC_PATH` con la ruta al archivo `x64\fxc.exe` del Windows SDK. El binario queda en `target/release/veltrix.exe`. CI ejecuta las mismas comprobaciones en Windows. La biblioteca no depende de GPUI.
 
-Para probar un instalador NSIS real con un paquete firmado de prueba, indique dónde está MakeNSIS:
+Para probar un instalador NSIS real en Windows con un paquete firmado de prueba, indique dónde está MakeNSIS:
 
 ```powershell
 $env:MAKENSIS = 'C:\Program Files (x86)\NSIS\makensis.exe'
 cargo test --locked -p veltrix signed_nsis_update_writes_only_to_chosen_installation -- --ignored
 cargo test --locked -p veltrix --test windows_e2e -- --ignored --test-threads=1
 ```
+
+### Compilar y probar en Linux (Kali Linux / Debian / Ubuntu)
+
+Instale las dependencias de compilación para GPUI Kit (X11, Wayland y Vulkan; en máquinas virtuales sin GPU Vulkan agregue también `mesa-vulkan-drivers`):
+
+```bash
+sudo apt update
+sudo apt install -y build-essential pkg-config \
+  libxkbcommon-dev libxkbcommon-x11-dev libxcb1-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+  libwayland-dev libfontconfig1-dev libfreetype-dev libvulkan-dev mesa-vulkan-drivers
+```
+
+Luego compile y ejecute las pruebas (incluidas las pruebas E2E nativas de Linux):
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo check --workspace --locked
+cargo test --workspace --locked
+cargo test --locked -p veltrix --test linux_e2e -- --ignored --test-threads=1
+cargo build --release --locked --bin veltrix
+```
+
+El binario queda en `target/release/veltrix`. En sesiones sin escritorio gráfico (`DISPLAY` y `WAYLAND_DISPLAY` vacíos, o `VELTRIX_HEADLESS=1`), `veltrix` ejecuta la actualización en modo consola manteniendo el mismo protocolo `READY`/`ERROR` y `events.jsonl`.
 
 ## Distribuir la aplicación
 
@@ -51,6 +75,8 @@ La instalación inicial la realiza NSIS. Incluya esta estructura dentro de una i
 ```
 
 El instalador debe admitir `/S` y respetar el `/D` que recibe, devolver un código distinto de cero ante errores, esperar a que terminen sus procesos auxiliares, actualizar `version.txt` al final y evitar iniciar por su cuenta la aplicación. Use `RequestExecutionLevel user` para instalaciones por usuario. Mantenga la configuración y los datos personales fuera del conjunto de archivos reemplazados. No sobrescriba los archivos activos dentro de `.updater` durante el proceso. [Parámetros de NSIS](https://nsis.sourceforge.io/Docs/Chapter3.html).
+
+En **Linux**, utilice la misma estructura dentro de un directorio propiedad del usuario sin permisos de escritura para grupo ni otros (`chmod 0700` o `0755`), con el binario ejecutable (`MyApp`), `.updater/veltrix` (`chmod 0755`) y paquetes firmados `package.tar.gz` (`update-linux-x86_64.json` y `update-linux-x86_64.json.sig`). El archivo `.tar.gz` debe contener los archivos de la aplicación y `version.txt`, sin enlaces simbólicos ni entradas dentro de `.updater/`. Veltrix extrae los archivos de forma atómica, preserva los permisos de ejecución y actualiza `version.txt` al final.
 
 ## Publicar un release
 
@@ -122,7 +148,7 @@ Puede aprovisionar un instalador anterior y sus archivos `manifest.json`, `manif
 - GitHub Releases se consulta hasta 1.000 elementos recientes de un repositorio público, en páginas acotadas. La selección considera los releases recibidos.
 - Se valida el ejecutable principal y el marcador local de versión. La consistencia de los demás archivos y de los datos de usuario depende del instalador de cada aplicación. Sin respaldo no hay reversión de cambios parciales.
 - El control de rutas y la copia protegida dependen de que el árbol de instalación y el directorio de trabajo estén protegidos contra otras cuentas. El diseño no aísla aplicaciones maliciosas con los mismos permisos ni instaladores firmados que incumplan el contrato.
-- Los parches incrementales y los ejecutables para Linux y macOS quedan pendientes.
+- Los parches incrementales y el ejecutable para macOS quedan pendientes.
 - El ejemplo GPUI inicia la búsqueda mediante `--update`, sin controles de selección ni cancelación. No hay selección de parches. El workflow de releases (`v*`) publica un ejecutable sin firma Authenticode junto con `SHA256SUMS.txt`; la firma Authenticode queda a cargo del proceso de distribución.
 
 
